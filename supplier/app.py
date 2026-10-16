@@ -55,6 +55,18 @@ def catalog():
     return [feed.public(cfg.public_url) | {"health": hub.health(feed.id)} for feed in FEEDS.values()]
 
 
+@app.get("/feeds/{feed_id}")
+def feed_detail(feed_id: str):
+    feed = FEEDS.get(feed_id)
+    if not feed:
+        raise HTTPException(404, "Unknown feed")
+    return feed.public(cfg.public_url) | {
+        "source": {"name": feed.source, "symbol": feed.symbol},
+        "coverage": {"mode": "live-only", "historical_storage": False, **hub.health(feed_id)},
+        "disclaimer": "Test-only feed; commercial redistribution rights are not verified.",
+    }
+
+
 @app.post("/auth/challenge")
 def challenge(body: WalletIn):
     try:
@@ -66,7 +78,7 @@ def challenge(body: WalletIn):
 @app.post("/auth/verify")
 def verify(body: VerifyIn):
     try:
-        return {"token": wallet_auth.verify(body.wallet, body.signature)}
+        return {"token": wallet_auth.verify(body.wallet, body.signature), "wallet": body.wallet.lower()}
     except ValueError as exc:
         raise HTTPException(401, str(exc)) from exc
 

@@ -19,7 +19,16 @@ class Feed:
         value.pop("subscribe")
         value.update(
             {
+                "title": self.name,
+                "category": "Market data",
+                "format": "JSON",
+                "bytes": None,
+                "rows": None,
+                "seller": "external-supplier",
+                "version": 1,
+                "protocol": self.source,
                 "delivery_type": "LIVE_STREAM",
+                "delivery_method": "LIVE_STREAM",
                 "delivery_url": f"{public_url}/feeds/{self.id}/stream",
                 "price": "1.00",
                 "currency": "test USDC",
