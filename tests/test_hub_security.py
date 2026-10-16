@@ -1,7 +1,9 @@
 import pytest
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
 from supplier.hub import FeedHub
-from supplier.security import TokenIssuer
+from supplier.security import TokenIssuer, WalletAuth
 
 
 def test_bounded_queue_drops_oldest():
@@ -29,3 +31,19 @@ def test_subscribers_share_hub():
     first, second = hub.subscribe("feed"), hub.subscribe("feed")
     hub.publish("feed", {"n": 1})
     assert first.get_nowait() == second.get_nowait() == {"n": 1}
+
+
+def test_wallet_session_binds_chain_contract_feed_expiry_and_nonce():
+    account = Account.create()
+    issuer = TokenIssuer("x" * 32)
+    auth = WalletAuth(issuer)
+    message = auth.challenge(account.address, "feed-a", 84532, "0x" + "1" * 40, 12345)
+    signature = Account.sign_message(encode_defunct(text=message), account.key).signature.hex()
+    token = auth.verify(account.address, message, signature)
+    claims = issuer.claim(token, "session")
+    assert claims["feed_id"] == "feed-a"
+    assert claims["chain_id"] == 84532
+    assert claims["contract"] == "0x" + "1" * 40
+    assert claims["entitlement_expiry"] == 12345
+    with pytest.raises(ValueError):
+        auth.verify(account.address, message, signature)

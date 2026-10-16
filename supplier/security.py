@@ -20,13 +20,14 @@ class TokenIssuer:
         self.secret = secret.encode()
         self.used: set[str] = set()
 
-    def issue(self, wallet: str, audience: str, lifetime: int = 60) -> str:
+    def issue(self, wallet: str, audience: str, lifetime: int = 60, claims: dict | None = None) -> str:
         payload = {
             "sub": wallet.lower(),
             "aud": audience,
             "exp": int(time.time()) + lifetime,
             "jti": secrets.token_urlsafe(16),
         }
+        payload.update(claims or {})
         body = _b64(json.dumps(payload, separators=(",", ":")).encode())
         return f"{body}.{_b64(hmac.new(self.secret, body.encode(), hashlib.sha256).digest())}"
 
@@ -46,24 +47,42 @@ class TokenIssuer:
 class WalletAuth:
     def __init__(self, issuer: TokenIssuer):
         self.issuer = issuer
-        self.challenges: dict[str, tuple[str, float]] = {}
+        self.challenges: dict[str, tuple[str, float, dict]] = {}
 
-    def challenge(self, wallet: str) -> str:
+    def challenge(self, wallet: str, feed_id: str, chain_id: int, contract: str, entitlement_expiry: int) -> str:
         if not is_address(wallet):
             raise ValueError("invalid wallet")
         nonce = secrets.token_urlsafe(24)
-        message = f"UME supplier authentication\nWallet: {wallet.lower()}\nNonce: {nonce}"
-        self.challenges[wallet.lower()] = (message, time.time() + 300)
+        context = {
+            "feed_id": feed_id,
+            "chain_id": chain_id,
+            "contract": contract.lower(),
+            "entitlement_expiry": entitlement_expiry,
+        }
+        message = "\n".join(
+            [
+                "UME supplier authentication",
+                f"Wallet: {wallet.lower()}",
+                f"Chain ID: {chain_id}",
+                f"Contract: {contract.lower()}",
+                f"Feed ID: {feed_id}",
+                f"Entitlement expiry: {entitlement_expiry}",
+                f"Nonce: {nonce}",
+            ]
+        )
+        self.challenges[wallet.lower()] = (message, time.time() + 300, context)
         return message
 
-    def verify(self, wallet: str, signature: str) -> str:
+    def verify(self, wallet: str, message: str, signature: str) -> str:
         entry = self.challenges.pop(wallet.lower(), None)
         if not entry or entry[1] <= time.time():
             raise ValueError("challenge missing or expired")
+        if message != entry[0]:
+            raise ValueError("challenge message mismatch")
         recovered = Account.recover_message(encode_defunct(text=entry[0]), signature=signature)
         if recovered.lower() != wallet.lower():
             raise ValueError("signature does not match wallet")
-        return self.issuer.issue(wallet, "session", 3600)
+        return self.issuer.issue(wallet, "session", 3600, entry[2])
 
 
 class Entitlements:
@@ -94,4 +113,20 @@ class Entitlements:
         return int(result["result"], 16)
 
     async def active(self, wallet: str, feed_id: str) -> bool:
-        return await self.expires_at(wallet, feed_id) > time.time()
+        expiry, chain_time = await self.status(wallet, feed_id)
+        return expiry > chain_time
+
+    async def chain_time(self) -> int:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                self.rpc_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": "eth_getBlockByNumber", "params": ["latest", False]},
+            )
+            response.raise_for_status()
+            result = response.json()
+        if "error" in result:
+            raise RuntimeError(result["error"]["message"])
+        return int(result["result"]["timestamp"], 16)
+
+    async def status(self, wallet: str, feed_id: str) -> tuple[int, int]:
+        return await self.expires_at(wallet, feed_id), await self.chain_time()

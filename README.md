@@ -6,7 +6,10 @@ An independent FastAPI service that fans out five real exchange WebSocket feeds 
 
 Every bundled listing is `TEST_ONLY_RIGHTS_UNVERIFIED` and `purchasable: false`. Public WebSocket availability is not permission to resell market data. Do not make a listing purchasable until the exchange has granted the necessary redistribution rights and UME has configured its on-chain feed.
 
-The current UME `FeedAccess` contract pays the seller directly and has no treasury-fee mechanism. This service does not invent or bypass settlement. Production UME is also currently configured in intake-only mode. The requested seller/treasury split therefore requires a separately reviewed marketplace change and contract deployment approval.
+The paid-delivery feature branch pairs this service with a revised UME
+`FeedAccess` contract that atomically splits payment between seller and treasury.
+That contract has been verified only with disposable local Anvil wallets and
+`LocalUSDC`; it has not been deployed to production or a public testnet.
 
 ## Run locally
 
@@ -23,6 +26,11 @@ For hosted UME, run `./scripts/start_supplier_tunnel.sh`. It downloads a pinned,
 
 Buyer flow: request a challenge, sign its exact text with the buyer wallet, exchange it for a session, and request a short-lived stream ticket. Connect to `ws://localhost:8090/feeds/{feed_id}/stream?ticket=...`. The supplier checks `FeedAccess.expiresAt` before issuing the ticket and during the connection; a transaction hash is never accepted as proof.
 
+The challenge and session are bound to the wallet, feed, chain, FeedAccess
+contract, and observed entitlement expiry. Challenges are single-use. Active
+connections recheck chain time and entitlement every five seconds, even while
+events are flowing, so expiry closes delivery without relying on the host clock.
+
 ## Tests
 
 ```bash
@@ -35,7 +43,12 @@ ruff check .
 
 ## Marketplace integration status
 
-UME currently has a catalog adapter for its built-in Hyperliquid service, but no authenticated, persistent API for an ordinary seller to register an externally delivered live listing without uploading a file. The next marketplace PR must add that minimal capability with server-side URL allowlisting/SSRF controls, persistent service identity, and idempotent seller-scoped keys. Until that API exists, this supplier exposes accurate catalog metadata but does not pretend that five durable UME listings were registered.
+UME has an authenticated, persistent external-listing API with server-side URL
+validation, supplier ownership proof, health monitoring, and seller-scoped
+idempotency. Paid delivery additionally requires that the listing feed, price,
+duration, seller, payment token, chain, and FeedAccess contract agree with
+on-chain configuration. Production remains test-only/non-purchasable until a
+separately reviewed public-testnet or production deployment is configured.
 
 See [docs/architecture.md](docs/architecture.md), [docs/integration-status.md](docs/integration-status.md),
 and [docs/upstream-sources-and-rights.md](docs/upstream-sources-and-rights.md).
