@@ -34,5 +34,5 @@ ruff check .
 
 UME currently has a catalog adapter for its built-in Hyperliquid service, but no authenticated, persistent API for an ordinary seller to register an externally delivered live listing without uploading a file. The next marketplace PR must add that minimal capability with server-side URL allowlisting/SSRF controls, persistent service identity, and idempotent seller-scoped keys. Until that API exists, this supplier exposes accurate catalog metadata but does not pretend that five durable UME listings were registered.
 
-See [docs/architecture.md](docs/architecture.md) and [docs/integration-status.md](docs/integration-status.md).
-
+See [docs/architecture.md](docs/architecture.md), [docs/integration-status.md](docs/integration-status.md),
+and [docs/upstream-sources-and-rights.md](docs/upstream-sources-and-rights.md).
