@@ -12,7 +12,8 @@ The current UME `FeedAccess` contract pays the seller directly and has no treasu
 
 ```bash
 cp .env.example .env
-# Set SUPPLIER_FEED_ACCESS_ADDRESS to the existing local deployment.
+# For a host-run supplier, set SUPPLIER_RPC_URL=http://127.0.0.1:8545 and
+# SUPPLIER_FEED_ACCESS_ADDRESS to the existing local deployment.
 ./scripts/start_supplier.sh
 ```
 

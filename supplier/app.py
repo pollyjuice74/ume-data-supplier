@@ -4,6 +4,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .catalog import FEEDS
@@ -28,6 +29,13 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="UME Independent Data Supplier", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cfg.allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 
 class WalletIn(BaseModel):
@@ -52,7 +60,7 @@ def health():
 
 @app.get("/catalog/listings")
 def catalog():
-    return [feed.public(cfg.public_url) | {"health": hub.health(feed.id)} for feed in FEEDS.values()]
+    return [feed.public(cfg.public_url, cfg.owner_wallet) | {"health": hub.health(feed.id)} for feed in FEEDS.values()]
 
 
 @app.get("/feeds/{feed_id}")
@@ -60,11 +68,21 @@ def feed_detail(feed_id: str):
     feed = FEEDS.get(feed_id)
     if not feed:
         raise HTTPException(404, "Unknown feed")
-    return feed.public(cfg.public_url) | {
+    return feed.public(cfg.public_url, cfg.owner_wallet) | {
         "source": {"name": feed.source, "symbol": feed.symbol},
         "coverage": {"mode": "live-only", "historical_storage": False, **hub.health(feed_id)},
         "disclaimer": "Test-only feed; commercial redistribution rights are not verified.",
     }
+
+
+@app.get("/feeds/{feed_id}/sample")
+def feed_sample(feed_id: str):
+    if feed_id not in FEEDS:
+        raise HTTPException(404, "Unknown feed")
+    event = hub.latest.get(feed_id)
+    if not event:
+        raise HTTPException(503, "No live sample is available yet")
+    return {"verification_basis": "LIVE_BOUNDED_SAMPLE", "event": event}
 
 
 @app.post("/auth/challenge")

@@ -19,6 +19,7 @@ class FeedHub:
         self.subscribers: dict[str, set[asyncio.Queue]] = defaultdict(set)
         self.tasks: dict[str, asyncio.Task] = {}
         self.last_event: dict[str, datetime] = {}
+        self.latest: dict[str, dict] = {}
         self.connected: dict[str, bool] = defaultdict(bool)
         self.reconnects: dict[str, int] = defaultdict(int)
 
@@ -40,6 +41,7 @@ class FeedHub:
 
     def publish(self, feed_id: str, event: dict) -> None:
         self.last_event[feed_id] = datetime.now(UTC)
+        self.latest[feed_id] = event
         for queue in tuple(self.subscribers[feed_id]):
             if queue.full():
                 queue.get_nowait()
