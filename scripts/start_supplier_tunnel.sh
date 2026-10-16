@@ -44,6 +44,13 @@ export SUPPLIER_PUBLIC_URL="$public_url"
 export SUPPLIER_CORS_ORIGINS="${SUPPLIER_CORS_ORIGINS:-https://kpm-intake-web.onrender.com,http://localhost:3000,http://127.0.0.1:3000}"
 echo "Supplier URL: $public_url"
 echo "Paste this exact HTTPS URL into Sell Data: https://kpm-intake-web.onrender.com/sell"
-./scripts/start_supplier.sh &
-supplier_pid=$!
-wait "$supplier_pid"
+while true; do
+  ./scripts/start_supplier.sh &
+  supplier_pid=$!
+  wait "$supplier_pid" || true
+  supplier_pid=""
+  echo
+  echo "Supplier stopped; the tunnel and public URL are still active."
+  echo "Press Enter to restart the supplier, or Ctrl+C to stop everything."
+  read -r || exit 0
+done
