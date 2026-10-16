@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: ume-data-supplier
+    runtime: docker
+    plan: starter
+    autoDeployTrigger: off
+    healthCheckPath: /health
+    envVars:
+      - key: SUPPLIER_PUBLIC_URL
+        sync: false
+      - key: SUPPLIER_RPC_URL
+        sync: false
+      - key: SUPPLIER_CHAIN_ID
+        value: "84532"
+      - key: SUPPLIER_FEED_ACCESS_ADDRESS
+        sync: false
+      - key: SUPPLIER_SESSION_SECRET
+        generateValue: true
+      - key: SUPPLIER_UME_API_URL
+        sync: false
+

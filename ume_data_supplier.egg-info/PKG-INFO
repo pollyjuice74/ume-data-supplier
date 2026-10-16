@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: ume-data-supplier
+Version: 0.1.0
+Summary: Independent authenticated live-data supplier for UME
+Requires-Python: >=3.11
+Requires-Dist: fastapi<1,>=0.115
+Requires-Dist: uvicorn[standard]<1,>=0.34
+Requires-Dist: websockets<16,>=14
+Requires-Dist: httpx<1,>=0.28
+Requires-Dist: pydantic-settings<3,>=2.7
+Requires-Dist: eth-account<1,>=0.13
+Requires-Dist: eth-utils<6,>=5
+Provides-Extra: dev
+Requires-Dist: pytest<9,>=8; extra == "dev"
+Requires-Dist: pytest-asyncio<1,>=0.25; extra == "dev"
+Requires-Dist: ruff<1,>=0.9; extra == "dev"

@@ -1,0 +1,13 @@
+services:
+  supplier:
+    build: .
+    env_file: .env
+    ports: ["8090:8090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
