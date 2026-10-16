@@ -3,10 +3,10 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
 from eth_account import Account
 from eth_account.messages import encode_defunct
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .catalog import FEEDS
@@ -56,12 +56,14 @@ class OwnershipIn(BaseModel):
 
 
 def ownership_message() -> str:
-    return "\n".join([
-        "UME supplier origin ownership",
-        "Version: 1",
-        f"Supplier: {cfg.public_url.rstrip('/')}",
-        f"Owner: {cfg.owner_wallet.lower()}",
-    ])
+    return "\n".join(
+        [
+            "UME supplier origin ownership",
+            "Version: 1",
+            f"Supplier: {cfg.public_url.rstrip('/')}",
+            f"Owner: {cfg.owner_wallet.lower()}",
+        ]
+    )
 
 
 ownership_proof: dict | None = None
@@ -94,14 +96,26 @@ def ownership():
         raise HTTPException(503, "Supplier owner wallet does not match the signing key")
     message = ownership_message()
     signature = Account.sign_message(encode_defunct(text=message), cfg.seller_private_key).signature.hex()
-    return {"owner_wallet": account.address.lower(), "supplier_url": cfg.public_url.rstrip("/"), "message": message, "signature": "0x" + signature.removeprefix("0x")}
+    return {
+        "owner_wallet": account.address.lower(),
+        "supplier_url": cfg.public_url.rstrip("/"),
+        "message": message,
+        "signature": "0x" + signature.removeprefix("0x"),
+    }
 
 
 @app.post("/ownership")
 def pair_ownership(body: OwnershipIn):
     global ownership_proof
     expected_url = cfg.public_url.rstrip("/")
-    expected = "\n".join(["UME supplier origin ownership", "Version: 1", f"Supplier: {expected_url}", f"Owner: {body.owner_wallet.lower()}"])
+    expected = "\n".join(
+        [
+            "UME supplier origin ownership",
+            "Version: 1",
+            f"Supplier: {expected_url}",
+            f"Owner: {body.owner_wallet.lower()}",
+        ]
+    )
     if body.supplier_url != expected_url or body.message != expected:
         raise HTTPException(422, "Ownership proof must bind this exact supplier origin")
     try:
@@ -116,7 +130,9 @@ def pair_ownership(body: OwnershipIn):
 
 @app.get("/catalog/listings")
 def catalog():
-    return [feed.public(cfg.public_url, current_owner_wallet()) | {"health": hub.health(feed.id)} for feed in FEEDS.values()]
+    return [
+        feed.public(cfg.public_url, current_owner_wallet()) | {"health": hub.health(feed.id)} for feed in FEEDS.values()
+    ]
 
 
 @app.get("/feeds/{feed_id}")
