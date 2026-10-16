@@ -42,9 +42,11 @@ app.add_middleware(
 
 class WalletIn(BaseModel):
     wallet: str
+    feed_id: str
 
 
 class VerifyIn(WalletIn):
+    message: str
     signature: str
 
 
@@ -82,7 +84,15 @@ def session(authorization: str = Header("")) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "live_enabled": cfg.enable_live, "feeds": {key: hub.health(key) for key in FEEDS}}
+    return {
+        "status": "ok",
+        "live_enabled": cfg.enable_live,
+        "chain_id": cfg.chain_id,
+        "feed_access_address": cfg.feed_access_address.lower(),
+        "public_url": cfg.public_url.rstrip("/"),
+        "owner_wallet": current_owner_wallet().lower(),
+        "feeds": {key: hub.health(key) for key in FEEDS},
+    }
 
 
 @app.get("/ownership")
@@ -158,9 +168,14 @@ def feed_sample(feed_id: str):
 
 
 @app.post("/auth/challenge")
-def challenge(body: WalletIn):
+async def challenge(body: WalletIn):
+    if body.feed_id not in FEEDS:
+        raise HTTPException(404, "Unknown feed")
     try:
-        return {"message": wallet_auth.challenge(body.wallet)}
+        expiry = await entitlements.expires_at(body.wallet, body.feed_id)
+        return {
+            "message": wallet_auth.challenge(body.wallet, body.feed_id, cfg.chain_id, cfg.feed_access_address, expiry)
+        }
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -168,7 +183,10 @@ def challenge(body: WalletIn):
 @app.post("/auth/verify")
 def verify(body: VerifyIn):
     try:
-        return {"token": wallet_auth.verify(body.wallet, body.signature), "wallet": body.wallet.lower()}
+        return {
+            "token": wallet_auth.verify(body.wallet, body.message, body.signature),
+            "wallet": body.wallet.lower(),
+        }
     except ValueError as exc:
         raise HTTPException(401, str(exc)) from exc
 
@@ -177,10 +195,16 @@ def verify(body: VerifyIn):
 async def stream_ticket(feed_id: str, auth: dict = Depends(session)):
     if feed_id not in FEEDS:
         raise HTTPException(404, "Unknown feed")
-    expiry = await entitlements.expires_at(auth["sub"], feed_id)
-    if expiry <= time.time():
+    if (
+        auth.get("feed_id") != feed_id
+        or auth.get("chain_id") != cfg.chain_id
+        or auth.get("contract") != cfg.feed_access_address.lower()
+    ):
+        raise HTTPException(403, "Wallet session is not bound to this feed entitlement")
+    expiry, chain_time = await entitlements.status(auth["sub"], feed_id)
+    if expiry <= chain_time:
         raise HTTPException(403, "Active on-chain entitlement required")
-    lifetime = min(60, max(1, expiry - int(time.time())))
+    lifetime = min(60, max(1, expiry - chain_time))
     return {"ticket": issuer.issue(auth["sub"], f"stream:{feed_id}", lifetime), "expires_at": expiry}
 
 
@@ -198,10 +222,16 @@ async def stream(websocket: WebSocket, feed_id: str, ticket: str):
         return
     await websocket.accept()
     queue = hub.subscribe(feed_id)
+    next_entitlement_check = time.monotonic() + 5
     try:
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=15)
+                if time.monotonic() >= next_entitlement_check:
+                    if not await entitlements.active(claim["sub"], feed_id):
+                        await websocket.close(code=4403, reason="entitlement expired")
+                        return
+                    next_entitlement_check = time.monotonic() + 5
                 await websocket.send_json(event)
             except TimeoutError:
                 if not await entitlements.active(claim["sub"], feed_id):
