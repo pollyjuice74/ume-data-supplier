@@ -13,7 +13,7 @@ class Feed:
     subscribe: dict | None
     schema: dict
 
-    def public(self, public_url: str) -> dict:
+    def public(self, public_url: str, owner_wallet: str) -> dict:
         value = asdict(self)
         value.pop("upstream_url")
         value.pop("subscribe")
@@ -24,7 +24,8 @@ class Feed:
                 "format": "JSON",
                 "bytes": None,
                 "rows": None,
-                "seller": "external-supplier",
+                "seller": owner_wallet.lower(),
+                "supplier_owner_wallet": owner_wallet.lower(),
                 "version": 1,
                 "protocol": self.source,
                 "delivery_type": "LIVE_STREAM",
