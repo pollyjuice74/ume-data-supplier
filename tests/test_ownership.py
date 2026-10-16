@@ -32,3 +32,16 @@ def test_browser_wallet_can_pair_exact_origin(monkeypatch):
         )
     )
     assert supplier_app.ownership() == result
+
+
+def test_health_identifies_supplier_runtime(monkeypatch):
+    monkeypatch.setattr(supplier_app.cfg, "chain_id", 31337)
+    monkeypatch.setattr(supplier_app.cfg, "feed_access_address", "0x" + "A" * 40)
+    monkeypatch.setattr(supplier_app.cfg, "public_url", "http://localhost:8090")
+    monkeypatch.setattr(supplier_app.cfg, "owner_wallet", "0x" + "B" * 40)
+    monkeypatch.setattr(supplier_app, "ownership_proof", None)
+    result = supplier_app.health()
+    assert result["chain_id"] == 31337
+    assert result["feed_access_address"] == "0x" + "a" * 40
+    assert result["public_url"] == "http://localhost:8090"
+    assert result["owner_wallet"] == "0x" + "b" * 40

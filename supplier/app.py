@@ -84,7 +84,15 @@ def session(authorization: str = Header("")) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "live_enabled": cfg.enable_live, "feeds": {key: hub.health(key) for key in FEEDS}}
+    return {
+        "status": "ok",
+        "live_enabled": cfg.enable_live,
+        "chain_id": cfg.chain_id,
+        "feed_access_address": cfg.feed_access_address.lower(),
+        "public_url": cfg.public_url.rstrip("/"),
+        "owner_wallet": current_owner_wallet().lower(),
+        "feeds": {key: hub.health(key) for key in FEEDS},
+    }
 
 
 @app.get("/ownership")
