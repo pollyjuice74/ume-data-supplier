@@ -19,6 +19,8 @@ cp .env.example .env
 
 Open `http://localhost:8090/docs`, `http://localhost:8090/health`, or `http://localhost:8090/catalog/listings`. Run UME separately; this process never starts or resets Anvil, UME, or its database.
 
+For hosted UME, run `./scripts/start_supplier_tunnel.sh`. It downloads a pinned, checksum-verified Cloudflare Tunnel client into the local cache when needed, prints the temporary HTTPS supplier URL, and starts the existing supplier behind it. The Sell Data page pairs that exact URL with the connected seller wallet; the supplier does not need the wallet private key. Keep the command running while the listing should be live.
+
 Buyer flow: request a challenge, sign its exact text with the buyer wallet, exchange it for a session, and request a short-lived stream ticket. Connect to `ws://localhost:8090/feeds/{feed_id}/stream?ticket=...`. The supplier checks `FeedAccess.expiresAt` before issuing the ticket and during the connection; a transaction hash is never accepted as proof.
 
 ## Tests

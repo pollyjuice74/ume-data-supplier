@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from eth_account import Account
+from eth_account.messages import encode_defunct
 from pydantic import BaseModel
 
 from .catalog import FEEDS
@@ -46,6 +48,29 @@ class VerifyIn(WalletIn):
     signature: str
 
 
+class OwnershipIn(BaseModel):
+    owner_wallet: str
+    supplier_url: str
+    message: str
+    signature: str
+
+
+def ownership_message() -> str:
+    return "\n".join([
+        "UME supplier origin ownership",
+        "Version: 1",
+        f"Supplier: {cfg.public_url.rstrip('/')}",
+        f"Owner: {cfg.owner_wallet.lower()}",
+    ])
+
+
+ownership_proof: dict | None = None
+
+
+def current_owner_wallet() -> str:
+    return ownership_proof["owner_wallet"] if ownership_proof else cfg.owner_wallet
+
+
 def session(authorization: str = Header("")) -> dict:
     try:
         return issuer.claim(authorization.removeprefix("Bearer "), "session")
@@ -58,9 +83,40 @@ def health():
     return {"status": "ok", "live_enabled": cfg.enable_live, "feeds": {key: hub.health(key) for key in FEEDS}}
 
 
+@app.get("/ownership")
+def ownership():
+    if ownership_proof:
+        return ownership_proof
+    if not cfg.seller_private_key:
+        raise HTTPException(503, "Pair this supplier with the connected seller wallet first")
+    account = Account.from_key(cfg.seller_private_key)
+    if account.address.lower() != cfg.owner_wallet.lower():
+        raise HTTPException(503, "Supplier owner wallet does not match the signing key")
+    message = ownership_message()
+    signature = Account.sign_message(encode_defunct(text=message), cfg.seller_private_key).signature.hex()
+    return {"owner_wallet": account.address.lower(), "supplier_url": cfg.public_url.rstrip("/"), "message": message, "signature": "0x" + signature.removeprefix("0x")}
+
+
+@app.post("/ownership")
+def pair_ownership(body: OwnershipIn):
+    global ownership_proof
+    expected_url = cfg.public_url.rstrip("/")
+    expected = "\n".join(["UME supplier origin ownership", "Version: 1", f"Supplier: {expected_url}", f"Owner: {body.owner_wallet.lower()}"])
+    if body.supplier_url != expected_url or body.message != expected:
+        raise HTTPException(422, "Ownership proof must bind this exact supplier origin")
+    try:
+        recovered = Account.recover_message(encode_defunct(text=body.message), signature=body.signature)
+    except Exception as exc:
+        raise HTTPException(401, "Ownership signature is invalid") from exc
+    if recovered.lower() != body.owner_wallet.lower():
+        raise HTTPException(401, "Ownership signature does not match the seller wallet")
+    ownership_proof = body.model_dump() | {"owner_wallet": body.owner_wallet.lower()}
+    return ownership_proof
+
+
 @app.get("/catalog/listings")
 def catalog():
-    return [feed.public(cfg.public_url, cfg.owner_wallet) | {"health": hub.health(feed.id)} for feed in FEEDS.values()]
+    return [feed.public(cfg.public_url, current_owner_wallet()) | {"health": hub.health(feed.id)} for feed in FEEDS.values()]
 
 
 @app.get("/feeds/{feed_id}")
@@ -68,7 +124,7 @@ def feed_detail(feed_id: str):
     feed = FEEDS.get(feed_id)
     if not feed:
         raise HTTPException(404, "Unknown feed")
-    return feed.public(cfg.public_url, cfg.owner_wallet) | {
+    return feed.public(cfg.public_url, current_owner_wallet()) | {
         "source": {"name": feed.source, "symbol": feed.symbol},
         "coverage": {"mode": "live-only", "historical_storage": False, **hub.health(feed_id)},
         "disclaimer": "Test-only feed; commercial redistribution rights are not verified.",
