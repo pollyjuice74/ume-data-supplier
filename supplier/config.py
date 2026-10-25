@@ -21,6 +21,15 @@ class Settings(BaseSettings):
     seller_private_key: str = ""
     owner_wallet: str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    database_path: str = "./data/supplier.sqlite3"
+    ethereum_rpc_url: str = "https://ethereum-rpc.publicnode.com"
+    ethereum_poll_seconds: float = Field(12, ge=1, le=300)
+    ethereum_confirmations: int = Field(2, ge=0, le=64)
+    ethereum_backfill_blocks: int = Field(2, ge=1, le=100)
+    retention_days: int = Field(14, ge=1, le=365)
+    max_events: int = Field(250_000, ge=1000, le=10_000_000)
+    export_max_rows: int = Field(50_000, ge=1, le=1_000_000)
+    expected_protocol_fee_bps: int = Field(250, ge=0, le=2000)
 
     @property
     def allowed_origins(self) -> list[str]:

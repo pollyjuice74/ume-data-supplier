@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import random
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import UTC, datetime
 
 import websockets
@@ -22,9 +22,15 @@ class FeedHub:
         self.latest: dict[str, dict] = {}
         self.connected: dict[str, bool] = defaultdict(bool)
         self.reconnects: dict[str, int] = defaultdict(int)
+        self.dropped: dict[str, int] = defaultdict(int)
+        self.event_times: dict[str, deque] = defaultdict(lambda: deque(maxlen=100_000))
 
     async def start(self) -> None:
-        self.tasks = {key: asyncio.create_task(self._run(feed), name=f"upstream:{key}") for key, feed in FEEDS.items()}
+        self.tasks = {
+            key: asyncio.create_task(self._run(feed), name=f"upstream:{key}")
+            for key, feed in FEEDS.items()
+            if feed.upstream_url
+        }
 
     async def stop(self) -> None:
         for task in self.tasks.values():
@@ -42,18 +48,25 @@ class FeedHub:
     def publish(self, feed_id: str, event: dict) -> None:
         self.last_event[feed_id] = datetime.now(UTC)
         self.latest[feed_id] = event
+        now = datetime.now(UTC)
+        self.event_times[feed_id].append(now.timestamp())
         for queue in tuple(self.subscribers[feed_id]):
             if queue.full():
                 queue.get_nowait()
+                self.dropped[feed_id] += 1
             queue.put_nowait(event)
 
     def health(self, feed_id: str) -> dict:
         last = self.last_event.get(feed_id)
+        cutoff = datetime.now(UTC).timestamp() - 60
+        recent = [value for value in self.event_times[feed_id] if value >= cutoff]
         return {
             "connected": self.connected[feed_id],
             "subscribers": len(self.subscribers[feed_id]),
             "last_event_at": last.isoformat() if last else None,
             "reconnects": self.reconnects[feed_id],
+            "dropped_events": self.dropped[feed_id],
+            "events_per_second_60s": len(recent) / 60,
         }
 
     async def _run(self, feed: Feed) -> None:

@@ -148,3 +148,39 @@ FEEDS = {
         ),
     ]
 }
+
+WALLET_EVENT_SCHEMA = {
+    "id": "ume.ethereum.wallet-events.v1",
+    "version": "1.0",
+    "fields": {
+        "event_id": "string",
+        "chain_id": "integer",
+        "block_number": "integer",
+        "block_hash": "0x-hash",
+        "transaction_hash": "0x-hash",
+        "log_index": "integer",
+        "event_type": "TOKEN_TRANSFER|UNISWAP_V2_SWAP|UNISWAP_V3_SWAP|INVENTORY_CHANGE",
+        "wallet": "0x-address|null",
+        "counterparty": "0x-address|null",
+        "asset": "0x-address|null",
+        "amount_raw": "signed decimal-string|null",
+        "source_timestamp": "RFC3339",
+        "supplier_observed_at": "RFC3339",
+        "normalized_at": "RFC3339",
+        "published_at": "RFC3339",
+        "provenance": "object",
+    },
+}
+
+WALLET_FEED = Feed(
+    "ethereum-wallet-trading-v1",
+    "Live Ethereum Wallet Trading Feed",
+    "Observed Ethereum ERC-20 transfers, Uniswap swaps, and window-relative inventory changes.",
+    "Ethereum",
+    "wallet-events",
+    "wallet_activity",
+    "",
+    None,
+    WALLET_EVENT_SCHEMA,
+)
+FEEDS[WALLET_FEED.id] = WALLET_FEED

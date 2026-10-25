@@ -95,3 +95,34 @@ class Entitlements:
 
     async def active(self, wallet: str, feed_id: str) -> bool:
         return await self.expires_at(wallet, feed_id) > time.time()
+
+    async def contract_status(self) -> dict:
+        if not self.contract or not is_address(self.contract):
+            return {"configured": False, "reason": "SUPPLIER_FEED_ACCESS_ADDRESS is not configured"}
+
+        async def read(signature: str) -> str:
+            data = "0x" + keccak(text=signature)[:4].hex()
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    self.rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "eth_call",
+                        "params": [{"to": self.contract, "data": data}, "latest"],
+                    },
+                )
+                response.raise_for_status()
+                body = response.json()
+            if body.get("error"):
+                raise RuntimeError(body["error"]["message"])
+            return body["result"]
+
+        treasury, fee, token = await read("treasury()"), await read("protocolFeeBps()"), await read("paymentToken()")
+        return {
+            "configured": True,
+            "feed_access": self.contract.lower(),
+            "payment_token": "0x" + token[-40:],
+            "protocol_fee_wallet": "0x" + treasury[-40:],
+            "protocol_fee_bps": int(fee, 16),
+        }

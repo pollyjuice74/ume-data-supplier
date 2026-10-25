@@ -2,17 +2,21 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from .catalog import FEEDS
 from .config import settings
 from .hub import FeedHub
 from .security import Entitlements, TokenIssuer, WalletAuth
+from .wallet_collector import EthereumWalletCollector
+from .wallet_store import WalletStore, utc_now
 
 cfg = settings()
 logging.basicConfig(level=logging.INFO, format='{"level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}')
@@ -20,13 +24,32 @@ hub = FeedHub(cfg.queue_size)
 issuer = TokenIssuer(cfg.session_secret)
 wallet_auth = WalletAuth(issuer)
 entitlements = Entitlements(cfg.rpc_url, cfg.feed_access_address)
+wallet_store = WalletStore(cfg.database_path)
+wallet_collector = EthereumWalletCollector(
+    cfg.ethereum_rpc_url,
+    wallet_store,
+    hub,
+    "ethereum-wallet-trading-v1",
+    cfg.ethereum_poll_seconds,
+    cfg.ethereum_confirmations,
+    cfg.ethereum_backfill_blocks,
+)
+wallet_collector.retention_days = cfg.retention_days
+wallet_collector.max_events = cfg.max_events
+wallet_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global wallet_task
     if cfg.enable_live:
         await hub.start()
+        wallet_task = asyncio.create_task(wallet_collector.run(), name="ethereum-wallet-collector")
     yield
+    if wallet_task:
+        wallet_task.cancel()
+        await asyncio.gather(wallet_task, return_exceptions=True)
+    await wallet_collector.close()
     await hub.stop()
 
 
@@ -82,7 +105,37 @@ def session(authorization: str = Header("")) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "live_enabled": cfg.enable_live, "feeds": {key: hub.health(key) for key in FEEDS}}
+    feed_health = {key: hub.health(key) for key in FEEDS}
+    wallet = feed_health["ethereum-wallet-trading-v1"] | wallet_collector.health() | wallet_store.coverage()
+    latest = wallet_store.latest(1)
+    last = wallet.get("last_event_at") or (latest[-1]["supplier_observed_at"] if latest else None)
+    age = time.time() - datetime.fromisoformat(last).timestamp() if last else None
+    if latest:
+        item = latest[-1]
+        source = datetime.fromisoformat(item["source_timestamp"])
+        observed = datetime.fromisoformat(item["supplier_observed_at"])
+        wallet["source_to_supplier_delay_ms"] = (observed - source).total_seconds() * 1000
+        wallet["source_to_supplier_measurement"] = "BLOCK_TIMESTAMP_TO_RPC_OBSERVATION"
+    else:
+        wallet["source_to_supplier_delay_ms"] = None
+        wallet["source_to_supplier_measurement"] = "UNAVAILABLE_NO_EVENT"
+    freshness_limit = max(cfg.stale_after_seconds, cfg.ethereum_poll_seconds * 2 + cfg.ethereum_confirmations * 15)
+    wallet["status"] = (
+        "ONLINE"
+        if wallet["collector_running"] and age is not None and age <= freshness_limit
+        else ("DELAYED" if wallet["collector_running"] else "OFFLINE")
+    )
+    wallet["freshness_threshold_seconds"] = freshness_limit
+    feed_health["ethereum-wallet-trading-v1"] = wallet
+    return {
+        "status": "ok" if wallet["status"] != "OFFLINE" else "degraded",
+        "live_enabled": cfg.enable_live,
+        "chain_id": cfg.chain_id,
+        "feed_access_address": cfg.feed_access_address.lower(),
+        "public_url": cfg.public_url.rstrip("/"),
+        "owner_wallet": current_owner_wallet().lower(),
+        "feeds": feed_health,
+    }
 
 
 @app.get("/ownership")
@@ -140,10 +193,18 @@ def feed_detail(feed_id: str):
     feed = FEEDS.get(feed_id)
     if not feed:
         raise HTTPException(404, "Unknown feed")
+    coverage = (
+        wallet_store.coverage()
+        if feed_id == "ethereum-wallet-trading-v1"
+        else {"mode": "live-only", "historical_storage": False, **hub.health(feed_id)}
+    )
     return feed.public(cfg.public_url, current_owner_wallet()) | {
         "source": {"name": feed.source, "symbol": feed.symbol},
-        "coverage": {"mode": "live-only", "historical_storage": False, **hub.health(feed_id)},
-        "disclaimer": "Test-only feed; commercial redistribution rights are not verified.",
+        "coverage": coverage,
+        "available_formats": ["SSE", "JSON", "CSV", "Parquet"]
+        if feed_id == "ethereum-wallet-trading-v1"
+        else ["WebSocket"],
+        "disclaimer": "On-chain observations only. Test-USDC marketplace terms are not real revenue.",
     }
 
 
@@ -151,7 +212,11 @@ def feed_detail(feed_id: str):
 def feed_sample(feed_id: str):
     if feed_id not in FEEDS:
         raise HTTPException(404, "Unknown feed")
-    event = hub.latest.get(feed_id)
+    event = hub.latest.get(feed_id) or (
+        wallet_store.latest(1, public=True)[-1]
+        if feed_id == "ethereum-wallet-trading-v1" and wallet_store.latest(1, public=True)
+        else None
+    )
     if not event:
         raise HTTPException(503, "No live sample is available yet")
     return {"verification_basis": "LIVE_BOUNDED_SAMPLE", "event": event}
@@ -182,6 +247,95 @@ async def stream_ticket(feed_id: str, auth: dict = Depends(session)):
         raise HTTPException(403, "Active on-chain entitlement required")
     lifetime = min(60, max(1, expiry - int(time.time())))
     return {"ticket": issuer.issue(auth["sub"], f"stream:{feed_id}", lifetime), "expires_at": expiry}
+
+
+@app.get("/feeds/{feed_id}/schema")
+def feed_schema(feed_id: str):
+    feed = FEEDS.get(feed_id)
+    if not feed:
+        raise HTTPException(404, "Unknown feed")
+    return feed.schema
+
+
+@app.get("/feeds/{feed_id}/sse")
+async def sse(feed_id: str, ticket: str = Query(...)):
+    if feed_id not in FEEDS:
+        raise HTTPException(404, "Unknown feed")
+    try:
+        claim = issuer.claim(ticket, f"stream:{feed_id}", single_use=True)
+        if not await entitlements.active(claim["sub"], feed_id):
+            raise ValueError("inactive")
+    except Exception as exc:
+        raise HTTPException(403, "Active on-chain entitlement and valid ticket required") from exc
+
+    async def events():
+        queue = hub.subscribe(feed_id)
+        try:
+            for item in wallet_store.latest(25):
+                yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(item)}\n\n"
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), 15)
+                    yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(item)}\n\n"
+                except TimeoutError:
+                    if not await entitlements.active(claim["sub"], feed_id):
+                        return
+                    yield f'event: heartbeat\ndata: {{"timestamp":"{utc_now()}"}}\n\n'
+        finally:
+            hub.unsubscribe(feed_id, queue)
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
+    )
+
+
+def hub_json(value: dict) -> str:
+    import json
+
+    return json.dumps(value, separators=(",", ":"))
+
+
+@app.get("/feeds/{feed_id}/history.{fmt}")
+async def history(feed_id: str, fmt: str, auth: dict = Depends(session)):
+    if feed_id != "ethereum-wallet-trading-v1" or fmt not in {"json", "csv", "parquet"}:
+        raise HTTPException(404, "Unknown export")
+    if not await entitlements.active(auth["sub"], feed_id):
+        raise HTTPException(403, "Active on-chain entitlement required")
+    media = {"json": "application/json", "csv": "text/csv", "parquet": "application/vnd.apache.parquet"}[fmt]
+    return Response(
+        wallet_store.export(fmt, cfg.export_max_rows),
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{feed_id}.{fmt}"'},
+    )
+
+
+class ReceiptIn(BaseModel):
+    event_id: str
+    buyer_receipt_at: str
+
+
+@app.post("/feeds/{feed_id}/delivery-ack")
+async def delivery_ack(feed_id: str, body: ReceiptIn, auth: dict = Depends(session)):
+    if not await entitlements.active(auth["sub"], feed_id):
+        raise HTTPException(403, "Active on-chain entitlement required")
+    try:
+        return wallet_store.receipt(body.event_id, auth["sub"], body.buyer_receipt_at)
+    except KeyError as exc:
+        raise HTTPException(404, "Unknown event") from exc
+
+
+@app.get("/payments/status")
+async def payments_status():
+    try:
+        status = await entitlements.contract_status()
+        status["expected_protocol_fee_bps"] = cfg.expected_protocol_fee_bps
+        status["fee_matches_expected"] = status.get("protocol_fee_bps") == cfg.expected_protocol_fee_bps
+        status["revenue_classification"] = (
+            "TEST_ONLY" if cfg.chain_id in {31337, 84532, 11155111} else "UNVERIFIED_PRODUCTION"
+        )
+        return status
+    except Exception as exc:
+        return {"configured": False, "reason": str(exc), "expected_protocol_fee_bps": cfg.expected_protocol_fee_bps}
 
 
 @app.websocket("/feeds/{feed_id}/stream")
