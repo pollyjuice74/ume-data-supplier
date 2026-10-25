@@ -16,6 +16,8 @@ from .config import settings
 from .hub import FeedHub
 from .security import Entitlements, TokenIssuer, WalletAuth
 from .wallet_collector import EthereumWalletCollector
+from .wallet_products import WALLET_FEED_IDS
+from .wallet_products import rows as product_rows
 from .wallet_store import WalletStore, utc_now
 
 cfg = settings()
@@ -29,7 +31,7 @@ wallet_collector = EthereumWalletCollector(
     cfg.ethereum_rpc_url,
     wallet_store,
     hub,
-    "ethereum-wallet-trading-v1",
+    "ethereum_wallet_trades_v1",
     cfg.ethereum_poll_seconds,
     cfg.ethereum_confirmations,
     cfg.ethereum_backfill_blocks,
@@ -106,7 +108,7 @@ def session(authorization: str = Header("")) -> dict:
 @app.get("/health")
 def health():
     feed_health = {key: hub.health(key) for key in FEEDS}
-    wallet = feed_health["ethereum-wallet-trading-v1"] | wallet_collector.health() | wallet_store.coverage()
+    wallet = feed_health["ethereum_wallet_trades_v1"] | wallet_collector.health() | wallet_store.coverage()
     latest = wallet_store.latest(1)
     last = wallet.get("last_event_at") or (latest[-1]["supplier_observed_at"] if latest else None)
     age = time.time() - datetime.fromisoformat(last).timestamp() if last else None
@@ -126,7 +128,18 @@ def health():
         else ("DELAYED" if wallet["collector_running"] else "OFFLINE")
     )
     wallet["freshness_threshold_seconds"] = freshness_limit
-    feed_health["ethereum-wallet-trading-v1"] = wallet
+    for feed_id in WALLET_FEED_IDS:
+        feed_health[feed_id] = (
+            feed_health[feed_id]
+            | wallet_collector.health()
+            | wallet_store.coverage()
+            | {
+                "status": wallet["status"],
+                "freshness_threshold_seconds": freshness_limit,
+                "source_to_supplier_delay_ms": wallet["source_to_supplier_delay_ms"],
+                "source_to_supplier_measurement": wallet["source_to_supplier_measurement"],
+            }
+        )
     return {
         "status": "ok" if wallet["status"] != "OFFLINE" else "degraded",
         "live_enabled": cfg.enable_live,
@@ -195,15 +208,13 @@ def feed_detail(feed_id: str):
         raise HTTPException(404, "Unknown feed")
     coverage = (
         wallet_store.coverage()
-        if feed_id == "ethereum-wallet-trading-v1"
+        if feed_id in WALLET_FEED_IDS
         else {"mode": "live-only", "historical_storage": False, **hub.health(feed_id)}
     )
     return feed.public(cfg.public_url, current_owner_wallet()) | {
         "source": {"name": feed.source, "symbol": feed.symbol},
         "coverage": coverage,
-        "available_formats": ["SSE", "JSON", "CSV", "Parquet"]
-        if feed_id == "ethereum-wallet-trading-v1"
-        else ["WebSocket"],
+        "available_formats": ["SSE", "JSON", "CSV", "Parquet"] if feed_id in WALLET_FEED_IDS else ["WebSocket"],
         "disclaimer": "On-chain observations only. Test-USDC marketplace terms are not real revenue.",
     }
 
@@ -212,11 +223,12 @@ def feed_detail(feed_id: str):
 def feed_sample(feed_id: str):
     if feed_id not in FEEDS:
         raise HTTPException(404, "Unknown feed")
-    event = hub.latest.get(feed_id) or (
-        wallet_store.latest(1, public=True)[-1]
-        if feed_id == "ethereum-wallet-trading-v1" and wallet_store.latest(1, public=True)
-        else None
+    projected = (
+        product_rows(feed_id, wallet_store.latest(500, public=False), wallet_store)
+        if feed_id in WALLET_FEED_IDS
+        else []
     )
+    event = hub.latest.get(feed_id) or (projected[-1] if projected else None)
     if not event:
         raise HTTPException(503, "No live sample is available yet")
     return {"verification_basis": "LIVE_BOUNDED_SAMPLE", "event": event}
@@ -271,7 +283,8 @@ async def sse(feed_id: str, ticket: str = Query(...)):
     async def events():
         queue = hub.subscribe(feed_id)
         try:
-            for item in wallet_store.latest(25):
+            replay = product_rows(feed_id, wallet_store.latest(500), wallet_store) if feed_id in WALLET_FEED_IDS else []
+            for item in replay[-25:]:
                 yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(item)}\n\n"
             while True:
                 try:
@@ -297,13 +310,13 @@ def hub_json(value: dict) -> str:
 
 @app.get("/feeds/{feed_id}/history.{fmt}")
 async def history(feed_id: str, fmt: str, auth: dict = Depends(session)):
-    if feed_id != "ethereum-wallet-trading-v1" or fmt not in {"json", "csv", "parquet"}:
+    if feed_id not in WALLET_FEED_IDS or fmt not in {"json", "csv", "parquet"}:
         raise HTTPException(404, "Unknown export")
     if not await entitlements.active(auth["sub"], feed_id):
         raise HTTPException(403, "Active on-chain entitlement required")
     media = {"json": "application/json", "csv": "text/csv", "parquet": "application/vnd.apache.parquet"}[fmt]
     return Response(
-        wallet_store.export(fmt, cfg.export_max_rows),
+        wallet_store.export_rows(product_rows(feed_id, wallet_store.latest(cfg.export_max_rows), wallet_store), fmt),
         media_type=media,
         headers={"Content-Disposition": f'attachment; filename="{feed_id}.{fmt}"'},
     )

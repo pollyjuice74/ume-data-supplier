@@ -2,7 +2,7 @@
 
 An independent FastAPI service that collects a bounded, restart-safe Ethereum wallet event feed and fans out existing exchange feeds. Delivery is protected with wallet authentication plus the existing UME `FeedAccess` entitlement contract.
 
-The production-oriented feed is `ethereum-wallet-trading-v1`: canonical ERC-20 transfers, Uniswap v2/v3 swaps, and window-relative inventory deltas stored incrementally in SQLite WAL. It exposes public metadata/schema/sample/health, an entitled SSE stream, and entitled JSON/CSV/Parquet history. It never accepts buyer private keys and does not execute trades.
+The production adapter exposes four products from the same bounded, restart-safe store: `ethereum_wallet_trades_v1`, `ethereum_wallet_inventory_deltas_v1`, `ethereum_wallet_behavior_v1`, and `ethereum_mirror_candidates_v1`. They expose public metadata/schema/sample/health plus entitled SSE and JSON/CSV/Parquet history. Inventory is explicitly window-relative; missing executable quote evidence produces `MISSED_NO_QUOTE` with null cost and PnL. The service never accepts buyer private keys or executes trades.
 
 ## Safety and commercial status
 
@@ -33,7 +33,7 @@ its bounded SQLite history and checkpoint will disappear on replacement.
 
 For hosted UME, run `./scripts/start_supplier_tunnel.sh`. It downloads a pinned, checksum-verified Cloudflare Tunnel client into the local cache when needed, prints the temporary HTTPS supplier URL, and starts the existing supplier behind it. The Sell Data page pairs that exact URL with the connected seller wallet; the supplier does not need the wallet private key. Keep the command running while the listing should be live. If the Python supplier stops, the helper keeps the tunnel URL alive; press Enter in the same terminal to restart the supplier at that URL, or Ctrl+C to stop everything.
 
-Buyer flow: request a challenge, sign its exact text with the buyer wallet, exchange it for a session, and request a short-lived stream ticket. Connect to `ws://localhost:8090/feeds/{feed_id}/stream?ticket=...`. The supplier checks `FeedAccess.expiresAt` before issuing the ticket and during the connection; a transaction hash is never accepted as proof.
+Buyer flow: request a challenge, sign its exact text with the buyer wallet, exchange it for a session, and request a short-lived stream ticket. Connect an `EventSource` to `http://localhost:8090/feeds/{feed_id}/sse?ticket=...`. The supplier checks `FeedAccess.expiresAt` before issuing the single-use ticket and during the connection; a transaction hash is never accepted as proof.
 
 ## Tests
 
@@ -47,7 +47,7 @@ ruff check .
 
 ## Marketplace integration status
 
-UME currently has a catalog adapter for its built-in Hyperliquid service, but no authenticated, persistent API for an ordinary seller to register an externally delivered live listing without uploading a file. The next marketplace PR must add that minimal capability with server-side URL allowlisting/SSRF controls, persistent service identity, and idempotent seller-scoped keys. Until that API exists, this supplier exposes accurate catalog metadata but does not pretend that five durable UME listings were registered.
+KPM now has an authenticated external supplier workflow with exact-origin allowlisting, SSRF controls, cryptographic origin ownership, idempotent seller-scoped listings, and testnet entitlement checks. Publishing still requires the seller to pair the origin and sign the listing in MetaMask. Each new feed must also be configured in the Sepolia `FeedAccess` contract by its owner; test USDC is not revenue.
 
 See [docs/architecture.md](docs/architecture.md), [docs/integration-status.md](docs/integration-status.md),
 and [docs/upstream-sources-and-rights.md](docs/upstream-sources-and-rights.md).

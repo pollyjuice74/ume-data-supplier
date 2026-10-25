@@ -149,38 +149,114 @@ FEEDS = {
     ]
 }
 
-WALLET_EVENT_SCHEMA = {
-    "id": "ume.ethereum.wallet-events.v1",
-    "version": "1.0",
-    "fields": {
-        "event_id": "string",
-        "chain_id": "integer",
-        "block_number": "integer",
-        "block_hash": "0x-hash",
-        "transaction_hash": "0x-hash",
-        "log_index": "integer",
-        "event_type": "TOKEN_TRANSFER|UNISWAP_V2_SWAP|UNISWAP_V3_SWAP|INVENTORY_CHANGE",
-        "wallet": "0x-address|null",
-        "counterparty": "0x-address|null",
-        "asset": "0x-address|null",
-        "amount_raw": "signed decimal-string|null",
-        "source_timestamp": "RFC3339",
-        "supplier_observed_at": "RFC3339",
-        "normalized_at": "RFC3339",
-        "published_at": "RFC3339",
-        "provenance": "object",
-    },
-}
 
-WALLET_FEED = Feed(
-    "ethereum-wallet-trading-v1",
-    "Live Ethereum Wallet Trading Feed",
-    "Observed Ethereum ERC-20 transfers, Uniswap swaps, and window-relative inventory changes.",
-    "Ethereum",
-    "wallet-events",
-    "wallet_activity",
-    "",
-    None,
-    WALLET_EVENT_SCHEMA,
-)
-FEEDS[WALLET_FEED.id] = WALLET_FEED
+def wallet_schema(schema_id: str, fields: dict) -> dict:
+    return {"$id": schema_id, "version": "1.0", "type": "object", "fields": fields}
+
+
+COMMON = {"event_id": "string", "chain_id": "integer", "provenance": "object"}
+WALLET_FEEDS = [
+    Feed(
+        "ethereum_wallet_trades_v1",
+        "Ethereum wallet trades v1",
+        "Observed Uniswap v2/v3 swap logs. Token pair fields remain null when pool metadata is unavailable.",
+        "Ethereum",
+        "wallet-trades",
+        "wallet_trades",
+        "",
+        None,
+        wallet_schema(
+            "ume.ethereum.wallet-trades.v1",
+            COMMON
+            | {
+                "block_number": "integer",
+                "block_timestamp": "RFC3339",
+                "tx_hash": "0x-hash",
+                "log_index": "integer",
+                "wallet": "0x-address|null",
+                "pool": "0x-address",
+                "token_in": "0x-address|null",
+                "token_out": "0x-address|null",
+                "amount_in_raw": "decimal-string|null",
+                "amount_out_raw": "decimal-string|null",
+            },
+        ),
+    ),
+    Feed(
+        "ethereum_wallet_inventory_deltas_v1",
+        "Ethereum wallet inventory deltas v1",
+        "Exact raw-unit ERC-20 deltas and window-relative inventory; not complete wallet balances.",
+        "Ethereum",
+        "inventory-deltas",
+        "wallet_inventory",
+        "",
+        None,
+        wallet_schema(
+            "ume.ethereum.wallet-inventory-deltas.v1",
+            COMMON
+            | {
+                "wallet": "0x-address",
+                "token_address": "0x-address",
+                "block_number": "integer",
+                "tx_hash": "0x-hash",
+                "delta_raw": "signed decimal-string",
+                "relative_inventory_raw": "signed decimal-string",
+                "balance_scope": "WINDOW_RELATIVE",
+            },
+        ),
+    ),
+    Feed(
+        "ethereum_wallet_behavior_v1",
+        "Ethereum wallet behavior v1",
+        "Bounded-window activity aggregates derived only from observed events; no profitability claim.",
+        "Ethereum",
+        "wallet-behavior",
+        "wallet_behavior",
+        "",
+        None,
+        wallet_schema(
+            "ume.ethereum.wallet-behavior.v1",
+            COMMON
+            | {
+                "wallet": "0x-address",
+                "observation_window": "object",
+                "trade_count": "integer",
+                "transfer_count": "integer",
+                "activity_frequency": "number|null",
+                "accumulation_metrics": "object",
+                "relationship_metrics": "object|null",
+                "lead_lag_metrics": "object|null",
+                "quality_flags": "array<string>",
+            },
+        ),
+    ),
+    Feed(
+        "ethereum_mirror_candidates_v1",
+        "Ethereum mirror candidates v1",
+        "Observed swap actions prepared for independent evaluation. Missing quotes are never assigned PnL.",
+        "Ethereum",
+        "mirror-candidates",
+        "mirror_candidates",
+        "",
+        None,
+        wallet_schema(
+            "ume.ethereum.mirror-candidates.v1",
+            COMMON
+            | {
+                "source_wallet": "0x-address|null",
+                "source_tx_hash": "0x-hash",
+                "observed_action": "string",
+                "token_in": "0x-address|null",
+                "token_out": "0x-address|null",
+                "observation_timestamp": "RFC3339",
+                "replication_delay_ms": "number|null",
+                "execution_status": "MISSED_NO_QUOTE",
+                "estimated_cost": "null",
+                "estimated_pnl": "null",
+                "missing_reason": "string",
+            },
+        ),
+    ),
+]
+for wallet_feed in WALLET_FEEDS:
+    FEEDS[wallet_feed.id] = wallet_feed

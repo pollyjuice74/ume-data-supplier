@@ -79,6 +79,13 @@ class WalletStore:
                 (block["number"], block["hash"], block["parent_hash"], block["source_timestamp"], block["observed_at"]),
             )
             for event in events:
+                if event["event_type"] == "INVENTORY_CHANGE":
+                    current = db.execute(
+                        "SELECT balance_raw FROM wallet_inventory WHERE chain_id=? AND wallet=? AND asset=?",
+                        (event["chain_id"], event["wallet"], event["asset"]),
+                    ).fetchone()
+                    balance = (int(current[0]) if current else 0) + int(event["amount_raw"])
+                    event["relative_inventory_raw"] = str(balance)
                 values = (
                     event["event_id"],
                     event["block_number"],
@@ -102,17 +109,18 @@ class WalletStore:
                 if cursor.rowcount:
                     inserted.append(event)
                     if event["event_type"] == "INVENTORY_CHANGE":
-                        current = db.execute(
-                            "SELECT balance_raw FROM wallet_inventory WHERE chain_id=1 AND wallet=? AND asset=?",
-                            (event["wallet"], event["asset"]),
-                        ).fetchone()
-                        balance = int(current[0]) if current else 0
-                        balance += int(event["amount_raw"])
                         db.execute(
-                            """INSERT INTO wallet_inventory VALUES(1,?,?,?,?,?)
+                            """INSERT INTO wallet_inventory VALUES(?,?,?,?,?,?)
                                ON CONFLICT(chain_id,wallet,asset) DO UPDATE SET balance_raw=excluded.balance_raw,
                                updated_event_id=excluded.updated_event_id,updated_at=excluded.updated_at""",
-                            (event["wallet"], event["asset"], str(balance), event["event_id"], event["normalized_at"]),
+                            (
+                                event["chain_id"],
+                                event["wallet"],
+                                event["asset"],
+                                str(balance),
+                                event["event_id"],
+                                event["normalized_at"],
+                            ),
                         )
             db.execute(
                 """INSERT INTO wallet_checkpoint VALUES('ethereum',?,?,?)
@@ -161,12 +169,20 @@ class WalletStore:
                 (max_events,),
             )
 
-    def latest(self, limit: int = 100, public: bool = False) -> list[dict]:
+    def latest(self, limit: int = 100, public: bool = False, event_types: tuple[str, ...] | None = None) -> list[dict]:
         limit = min(max(limit, 1), 50_000)
         with self.connect() as db:
-            rows = db.execute(
-                "SELECT payload_json FROM wallet_events ORDER BY block_number DESC,log_index DESC LIMIT ?", (limit,)
-            ).fetchall()
+            if event_types:
+                placeholders = ",".join("?" for _ in event_types)
+                rows = db.execute(
+                    f"SELECT payload_json FROM wallet_events WHERE event_type IN ({placeholders}) "
+                    "ORDER BY block_number DESC,log_index DESC LIMIT ?",
+                    (*event_types, limit),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT payload_json FROM wallet_events ORDER BY block_number DESC,log_index DESC LIMIT ?", (limit,)
+                ).fetchall()
         events = [json.loads(row[0]) for row in reversed(rows)]
         return events[-5:] if public else events
 
@@ -197,8 +213,7 @@ class WalletStore:
             ),
         }
 
-    def export(self, fmt: str, max_rows: int) -> bytes:
-        rows = self.latest(max_rows)
+    def export_rows(self, rows: list[dict], fmt: str) -> bytes:
         if fmt == "json":
             return json.dumps(rows, separators=(",", ":")).encode()
         flat = [
@@ -208,7 +223,8 @@ class WalletStore:
         if fmt == "csv":
             output = io.StringIO()
             if flat:
-                writer = csv.DictWriter(output, fieldnames=flat[0])
+                fieldnames = list(dict.fromkeys(key for row in flat for key in row))
+                writer = csv.DictWriter(output, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(flat)
             return output.getvalue().encode()
@@ -217,6 +233,22 @@ class WalletStore:
             pq.write_table(pa.Table.from_pylist(flat), output, compression="zstd")
             return output.getvalue()
         raise ValueError("unsupported format")
+
+    def export(self, fmt: str, max_rows: int) -> bytes:
+        """Backward-compatible raw export used by local operators and migrations."""
+        return self.export_rows(self.latest(max_rows), fmt)
+
+    def behavior(self, wallet: str) -> dict:
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT MIN(source_timestamp),MAX(source_timestamp),
+                   COUNT(DISTINCT CASE WHEN event_type LIKE 'UNISWAP_%' THEN transaction_hash END),
+                   COUNT(DISTINCT CASE WHEN event_type='TOKEN_TRANSFER' THEN transaction_hash END),
+                   COUNT(DISTINCT block_number)
+                   FROM wallet_events WHERE wallet=?""",
+                (wallet,),
+            ).fetchone()
+        return {"from": row[0], "to": row[1], "trade_count": row[2], "transfer_count": row[3], "active_blocks": row[4]}
 
     def receipt(self, event_id: str, wallet: str, receipt_at: str) -> dict:
         received = datetime.fromisoformat(receipt_at.replace("Z", "+00:00"))

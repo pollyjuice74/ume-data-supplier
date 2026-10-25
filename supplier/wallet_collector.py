@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import httpx
 from eth_utils import keccak
 
+from .wallet_products import WALLET_FEED_IDS, project
 from .wallet_store import WalletStore, utc_now
 
 TRANSFER = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
@@ -123,7 +124,11 @@ class EthereumWalletCollector:
         )
         self.hub.connected[self.feed_id] = True
         for event in inserted:
-            self.hub.publish(self.feed_id, event)
+            for feed_id in WALLET_FEED_IDS:
+                item = project(feed_id, event, self.store)
+                if item:
+                    self.hub.connected[feed_id] = True
+                    self.hub.publish(feed_id, item)
 
     def normalize(self, log: dict, source_timestamp: str, observed: str) -> list[dict]:
         topics = [item.lower() for item in log.get("topics", [])]

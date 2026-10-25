@@ -4,7 +4,8 @@ import pyarrow.parquet as pq
 from fastapi.testclient import TestClient
 
 from supplier import app as supplier_app
-from supplier.wallet_collector import TRANSFER, EthereumWalletCollector
+from supplier.wallet_collector import SWAP_V3, TRANSFER, EthereumWalletCollector
+from supplier.wallet_products import WALLET_FEED_IDS, project
 from supplier.wallet_store import WalletStore
 
 
@@ -88,12 +89,11 @@ def test_public_metadata_health_and_protected_history(monkeypatch, tmp_path):
     monkeypatch.setattr(supplier_app.entitlements, "active", active)
     session = supplier_app.issuer.issue("0x" + "44" * 20, "session", 60)
     with TestClient(supplier_app.app) as client:
-        assert client.get("/feeds/ethereum-wallet-trading-v1/schema").status_code == 200
-        assert client.get("/feeds/ethereum-wallet-trading-v1/sample").status_code == 200
-        assert client.get("/feeds/ethereum-wallet-trading-v1/history.csv").status_code == 401
-        response = client.get(
-            "/feeds/ethereum-wallet-trading-v1/history.csv", headers={"Authorization": f"Bearer {session}"}
-        )
+        feed = "ethereum_wallet_inventory_deltas_v1"
+        assert client.get(f"/feeds/{feed}/schema").status_code == 200
+        assert client.get(f"/feeds/{feed}/sample").status_code == 200
+        assert client.get(f"/feeds/{feed}/history.csv").status_code == 401
+        response = client.get(f"/feeds/{feed}/history.csv", headers={"Authorization": f"Bearer {session}"})
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/csv")
 
@@ -105,3 +105,19 @@ def test_delivery_receipt_is_explicit_about_clock_quality(tmp_path):
     store.ingest_block(block(), rows)
     result = store.receipt(rows[0]["event_id"], "0x" + "44" * 20, datetime.now(UTC).isoformat())
     assert result["measurement_status"] == "MEASURED_BUYER_REPORTED_CLOCKS_UNVERIFIED"
+
+
+def test_four_products_keep_missing_execution_evidence_null(tmp_path):
+    store = WalletStore(str(tmp_path / "products.sqlite3"))
+    collector = EthereumWalletCollector("http://unused", store, Hub(), "ethereum_wallet_trades_v1", 1, 0, 1)
+    log = transfer_log() | {
+        "topics": [SWAP_V3, "0x" + "00" * 12 + "22" * 20, "0x" + "00" * 12 + "33" * 20],
+        "data": "0x" + (25).to_bytes(32, "big").hex() + ((1 << 256) - 20).to_bytes(32, "big").hex(),
+    }
+    event = collector.normalize(log, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00")[0]
+    trade = project("ethereum_wallet_trades_v1", event, store)
+    mirror = project("ethereum_mirror_candidates_v1", event, store)
+    assert trade["amount_in_raw"] == "25" and trade["amount_out_raw"] == "20"
+    assert mirror["execution_status"] == "MISSED_NO_QUOTE"
+    assert mirror["estimated_pnl"] is None and mirror["estimated_cost"] is None
+    assert len(WALLET_FEED_IDS) == 4
