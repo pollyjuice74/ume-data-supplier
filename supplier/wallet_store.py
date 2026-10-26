@@ -3,11 +3,9 @@ import io
 import json
 import sqlite3
 import threading
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 
 def utc_now() -> str:
@@ -21,18 +19,23 @@ class WalletStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.behavior_cache: OrderedDict[str, dict] = OrderedDict()
+        self.behavior_cache_size = 2048
         self._migrate()
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=30)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA busy_timeout=30000")
         db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA cache_size=-4096")
+        db.execute("PRAGMA temp_store=FILE")
         return db
 
     def _migrate(self) -> None:
         with self.lock, self.connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA wal_autocheckpoint=256")
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS wallet_blocks(
@@ -79,6 +82,8 @@ class WalletStore:
                 (block["number"], block["hash"], block["parent_hash"], block["source_timestamp"], block["observed_at"]),
             )
             for event in events:
+                if event.get("wallet"):
+                    self.behavior_cache.pop(event["wallet"], None)
                 if event["event_type"] == "INVENTORY_CHANGE":
                     current = db.execute(
                         "SELECT balance_raw FROM wallet_inventory WHERE chain_id=? AND wallet=? AND asset=?",
@@ -132,6 +137,7 @@ class WalletStore:
 
     def rewind(self, from_block: int) -> None:
         with self.lock, self.connect() as db:
+            self.behavior_cache.clear()
             db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM wallet_events WHERE block_number>=?", (from_block,))
             db.execute("DELETE FROM wallet_blocks WHERE block_number>=?", (from_block,))
@@ -162,6 +168,7 @@ class WalletStore:
     def prune(self, retention_days: int, max_events: int) -> None:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
         with self.lock, self.connect() as db:
+            self.behavior_cache.clear()
             db.execute("DELETE FROM wallet_events WHERE source_timestamp<?", (cutoff,))
             db.execute(
                 """DELETE FROM wallet_events WHERE event_id IN (
@@ -229,6 +236,11 @@ class WalletStore:
                 writer.writerows(flat)
             return output.getvalue().encode()
         if fmt == "parquet":
+            # PyArrow has a large native footprint. Import it only for an actual
+            # Parquet request so the always-on collector does not pay that cost.
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
             output = io.BytesIO()
             pq.write_table(pa.Table.from_pylist(flat), output, compression="zstd")
             return output.getvalue()
@@ -239,6 +251,11 @@ class WalletStore:
         return self.export_rows(self.latest(max_rows), fmt)
 
     def behavior(self, wallet: str) -> dict:
+        with self.lock:
+            cached = self.behavior_cache.get(wallet)
+            if cached is not None:
+                self.behavior_cache.move_to_end(wallet)
+                return cached
         with self.connect() as db:
             row = db.execute(
                 """SELECT MIN(source_timestamp),MAX(source_timestamp),
@@ -248,7 +265,19 @@ class WalletStore:
                    FROM wallet_events WHERE wallet=?""",
                 (wallet,),
             ).fetchone()
-        return {"from": row[0], "to": row[1], "trade_count": row[2], "transfer_count": row[3], "active_blocks": row[4]}
+        result = {
+            "from": row[0],
+            "to": row[1],
+            "trade_count": row[2],
+            "transfer_count": row[3],
+            "active_blocks": row[4],
+        }
+        with self.lock:
+            self.behavior_cache[wallet] = result
+            self.behavior_cache.move_to_end(wallet)
+            while len(self.behavior_cache) > self.behavior_cache_size:
+                self.behavior_cache.popitem(last=False)
+        return result
 
     def receipt(self, event_id: str, wallet: str, receipt_at: str) -> dict:
         received = datetime.fromisoformat(receipt_at.replace("Z", "+00:00"))

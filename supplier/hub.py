@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import threading
 from collections import defaultdict, deque
 from datetime import UTC, datetime
 
@@ -14,8 +15,11 @@ log = logging.getLogger("supplier.hub")
 
 
 class FeedHub:
-    def __init__(self, queue_size: int):
+    def __init__(self, queue_size: int, rate_window_max_events: int = 4096, enable_exchange_feeds: bool = False):
         self.queue_size = queue_size
+        self.rate_window_max_events = rate_window_max_events
+        self.enable_exchange_feeds = enable_exchange_feeds
+        self.rate_lock = threading.Lock()
         self.subscribers: dict[str, set[asyncio.Queue]] = defaultdict(set)
         self.tasks: dict[str, asyncio.Task] = {}
         self.last_event: dict[str, datetime] = {}
@@ -23,9 +27,12 @@ class FeedHub:
         self.connected: dict[str, bool] = defaultdict(bool)
         self.reconnects: dict[str, int] = defaultdict(int)
         self.dropped: dict[str, int] = defaultdict(int)
-        self.event_times: dict[str, deque] = defaultdict(lambda: deque(maxlen=100_000))
+        self.event_times: dict[str, deque] = defaultdict(lambda: deque(maxlen=self.rate_window_max_events))
 
     async def start(self) -> None:
+        if not self.enable_exchange_feeds:
+            self.tasks = {}
+            return
         self.tasks = {
             key: asyncio.create_task(self._run(feed), name=f"upstream:{key}")
             for key, feed in FEEDS.items()
@@ -48,8 +55,13 @@ class FeedHub:
     def publish(self, feed_id: str, event: dict) -> None:
         self.last_event[feed_id] = datetime.now(UTC)
         self.latest[feed_id] = event
-        now = datetime.now(UTC)
-        self.event_times[feed_id].append(now.timestamp())
+        now = datetime.now(UTC).timestamp()
+        with self.rate_lock:
+            times = self.event_times[feed_id]
+            times.append(now)
+            cutoff = now - 60
+            while times and times[0] < cutoff:
+                times.popleft()
         for queue in tuple(self.subscribers[feed_id]):
             if queue.full():
                 queue.get_nowait()
@@ -59,14 +71,18 @@ class FeedHub:
     def health(self, feed_id: str) -> dict:
         last = self.last_event.get(feed_id)
         cutoff = datetime.now(UTC).timestamp() - 60
-        recent = [value for value in self.event_times[feed_id] if value >= cutoff]
+        with self.rate_lock:
+            times = self.event_times[feed_id]
+            while times and times[0] < cutoff:
+                times.popleft()
+            rate = len(times) / 60
         return {
             "connected": self.connected[feed_id],
             "subscribers": len(self.subscribers[feed_id]),
             "last_event_at": last.isoformat() if last else None,
             "reconnects": self.reconnects[feed_id],
             "dropped_events": self.dropped[feed_id],
-            "events_per_second_60s": len(recent) / 60,
+            "events_per_second_60s": rate,
         }
 
     async def _run(self, feed: Feed) -> None:

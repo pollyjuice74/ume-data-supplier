@@ -11,7 +11,9 @@ class Settings(BaseSettings):
     port: int = 8090
     public_url: str = "http://localhost:8090"
     enable_live: bool = True
-    queue_size: int = Field(256, ge=1, le=10_000)
+    enable_exchange_feeds: bool = False
+    queue_size: int = Field(64, ge=1, le=10_000)
+    rate_window_max_events: int = Field(4096, ge=60, le=100_000)
     stale_after_seconds: int = Field(30, ge=1)
     rpc_url: str = "http://127.0.0.1:8545"
     chain_id: int = 31337
@@ -28,7 +30,7 @@ class Settings(BaseSettings):
     ethereum_backfill_blocks: int = Field(2, ge=1, le=100)
     retention_days: int = Field(14, ge=1, le=365)
     max_events: int = Field(250_000, ge=1000, le=10_000_000)
-    export_max_rows: int = Field(50_000, ge=1, le=1_000_000)
+    export_max_rows: int = Field(10_000, ge=1, le=1_000_000)
     expected_protocol_fee_bps: int = Field(250, ge=0, le=2000)
 
     @property

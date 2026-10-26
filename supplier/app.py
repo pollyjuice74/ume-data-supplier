@@ -22,7 +22,7 @@ from .wallet_store import WalletStore, utc_now
 
 cfg = settings()
 logging.basicConfig(level=logging.INFO, format='{"level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}')
-hub = FeedHub(cfg.queue_size)
+hub = FeedHub(cfg.queue_size, cfg.rate_window_max_events, cfg.enable_exchange_feeds)
 issuer = TokenIssuer(cfg.session_secret)
 wallet_auth = WalletAuth(issuer)
 entitlements = Entitlements(cfg.rpc_url, cfg.feed_access_address)
@@ -107,8 +107,9 @@ def session(authorization: str = Header("")) -> dict:
 
 @app.get("/health")
 def health():
-    feed_health = {key: hub.health(key) for key in FEEDS}
-    wallet = feed_health["ethereum_wallet_trades_v1"] | wallet_collector.health() | wallet_store.coverage()
+    feed_health = {key: hub.health(key) for key in WALLET_FEED_IDS}
+    coverage = wallet_store.coverage()
+    wallet = feed_health["ethereum_wallet_trades_v1"] | wallet_collector.health() | coverage
     latest = wallet_store.latest(1)
     last = wallet.get("last_event_at") or (latest[-1]["supplier_observed_at"] if latest else None)
     age = time.time() - datetime.fromisoformat(last).timestamp() if last else None
@@ -132,7 +133,7 @@ def health():
         feed_health[feed_id] = (
             feed_health[feed_id]
             | wallet_collector.health()
-            | wallet_store.coverage()
+            | coverage
             | {
                 "status": wallet["status"],
                 "freshness_threshold_seconds": freshness_limit,
@@ -197,7 +198,8 @@ def pair_ownership(body: OwnershipIn):
 @app.get("/catalog/listings")
 def catalog():
     return [
-        feed.public(cfg.public_url, current_owner_wallet()) | {"health": hub.health(feed.id)} for feed in FEEDS.values()
+        FEEDS[feed_id].public(cfg.public_url, current_owner_wallet()) | {"health": hub.health(feed_id)}
+        for feed_id in WALLET_FEED_IDS
     ]
 
 

@@ -89,6 +89,8 @@ def test_public_metadata_health_and_protected_history(monkeypatch, tmp_path):
     monkeypatch.setattr(supplier_app.entitlements, "active", active)
     session = supplier_app.issuer.issue("0x" + "44" * 20, "session", 60)
     with TestClient(supplier_app.app) as client:
+        catalog = client.get("/catalog/listings").json()
+        assert {item["id"] for item in catalog} == set(WALLET_FEED_IDS)
         feed = "ethereum_wallet_inventory_deltas_v1"
         assert client.get(f"/feeds/{feed}/schema").status_code == 200
         assert client.get(f"/feeds/{feed}/sample").status_code == 200

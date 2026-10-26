@@ -4,6 +4,12 @@ An independent FastAPI service that collects a bounded, restart-safe Ethereum wa
 
 The production adapter exposes four products from the same bounded, restart-safe store: `ethereum_wallet_trades_v1`, `ethereum_wallet_inventory_deltas_v1`, `ethereum_wallet_behavior_v1`, and `ethereum_mirror_candidates_v1`. They expose public metadata/schema/sample/health plus entitled SSE and JSON/CSV/Parquet history. Inventory is explicitly window-relative; missing executable quote evidence produces `MISSED_NO_QUOTE` with null cost and PnL. The service never accepts buyer private keys or executes trades.
 
+Binance, Coinbase, Kraken, and Hyperliquid collectors are disabled by default. Set
+`SUPPLIER_ENABLE_EXCHANGE_FEEDS=true` only in a deployment that intentionally serves those unrelated feeds. The public
+supplier catalog contains only the four wallet products. Per-buyer queues, delivery-rate windows, SQLite history, and
+exports are bounded; PyArrow is loaded lazily only when a buyer requests Parquet.
+The 256 MB deployment defaults to at most 10,000 rows per export and a 4 MiB SQLite page cache per connection.
+
 ## Safety and commercial status
 
 Every bundled listing is `TEST_ONLY_RIGHTS_UNVERIFIED` and `purchasable: false`. Public WebSocket availability is not permission to resell market data. Do not make a listing purchasable until the exchange has granted the necessary redistribution rights and UME has configured its on-chain feed.
