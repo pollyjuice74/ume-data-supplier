@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from datetime import UTC, datetime
 
 import pyarrow.parquet as pq
@@ -123,3 +125,35 @@ def test_four_products_keep_missing_execution_evidence_null(tmp_path):
     assert mirror["execution_status"] == "MISSED_NO_QUOTE"
     assert mirror["estimated_pnl"] is None and mirror["estimated_cost"] is None
     assert len(WALLET_FEED_IDS) == 4
+
+
+async def test_sqlite_ingestion_does_not_block_health_and_sse_event_loop(monkeypatch, tmp_path):
+    store = WalletStore(str(tmp_path / "nonblocking.sqlite3"))
+    collector = EthereumWalletCollector("http://unused", store, Hub(), "ethereum_wallet_trades_v1", 1, 0, 1)
+    started, release = threading.Event(), threading.Event()
+    original_ingest = store.ingest_block
+
+    def blocked_ingest(block_row, events):
+        started.set()
+        release.wait(timeout=2)
+        return original_ingest(block_row, events)
+
+    async def rpc(method, _params):
+        if method == "eth_getBlockByNumber":
+            return {
+                "hash": "0x" + "ab" * 32,
+                "parentHash": "0x" + "cd" * 32,
+                "timestamp": hex(1_767_225_600),
+            }
+        return []
+
+    monkeypatch.setattr(store, "ingest_block", blocked_ingest)
+    monkeypatch.setattr(collector, "rpc", rpc)
+    task = asyncio.create_task(collector.collect_block(10))
+    try:
+        await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
+        # This models the scheduler work needed by /health and SSE heartbeat.
+        await asyncio.wait_for(asyncio.sleep(0.01), timeout=0.1)
+    finally:
+        release.set()
+        await task

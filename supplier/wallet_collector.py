@@ -88,17 +88,21 @@ class EthereumWalletCollector:
 
     async def collect_once(self):
         tip = quantity(await self.rpc("eth_blockNumber", [])) - self.confirmations
-        checkpoint = self.store.checkpoint()
+        # SQLite work must not run on the ASGI event loop.  A busy Ethereum
+        # block can contain thousands of transfers; on the production 0.1 vCPU
+        # instance synchronous ingestion made health checks and SSE heartbeats
+        # stop until the entire transaction/projection pass completed.
+        checkpoint = await asyncio.to_thread(self.store.checkpoint)
         if checkpoint:
             canonical = await self.rpc("eth_getBlockByNumber", [hex(checkpoint["block_number"]), False])
             if not canonical or canonical["hash"].lower() != checkpoint["block_hash"]:
-                self.store.rewind(max(0, checkpoint["block_number"] - self.backfill))
-                checkpoint = self.store.checkpoint()
+                await asyncio.to_thread(self.store.rewind, max(0, checkpoint["block_number"] - self.backfill))
+                checkpoint = await asyncio.to_thread(self.store.checkpoint)
         start = checkpoint["block_number"] + 1 if checkpoint else max(0, tip - self.backfill + 1)
         for number in range(start, tip + 1):
             await self.collect_block(number)
         if time.monotonic() - self.last_prune >= 3600:
-            self.store.prune(self.retention_days, self.max_events)
+            await asyncio.to_thread(self.store.prune, self.retention_days, self.max_events)
             self.last_prune = time.monotonic()
 
     async def collect_block(self, number: int):
@@ -112,7 +116,8 @@ class EthereumWalletCollector:
         events = []
         for log in logs:
             events.extend(self.normalize(log, timestamp, observed))
-        inserted = self.store.ingest_block(
+        inserted, projected = await asyncio.to_thread(
+            self._persist_and_project,
             {
                 "number": number,
                 "hash": block["hash"].lower(),
@@ -123,12 +128,21 @@ class EthereumWalletCollector:
             events,
         )
         self.hub.connected[self.feed_id] = True
+        for feed_id, item in projected:
+            self.hub.connected[feed_id] = True
+            self.hub.publish(feed_id, item)
+        return inserted
+
+    def _persist_and_project(self, block: dict, events: list[dict]) -> tuple[list[dict], list[tuple[str, dict]]]:
+        """Perform all blocking SQLite work in one worker-thread call."""
+        inserted = self.store.ingest_block(block, events)
+        projected = []
         for event in inserted:
             for feed_id in WALLET_FEED_IDS:
                 item = project(feed_id, event, self.store)
                 if item:
-                    self.hub.connected[feed_id] = True
-                    self.hub.publish(feed_id, item)
+                    projected.append((feed_id, item))
+        return inserted, projected
 
     def normalize(self, log: dict, source_timestamp: str, observed: str) -> list[dict]:
         topics = [item.lower() for item in log.get("topics", [])]
