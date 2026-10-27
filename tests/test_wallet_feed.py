@@ -115,6 +115,13 @@ def test_delivery_receipt_is_explicit_about_clock_quality(tmp_path):
     assert result["measurement_status"] == "MEASURED_BUYER_REPORTED_CLOCKS_UNVERIFIED"
 
 
+def test_supplier_ownership_proof_survives_store_restart(tmp_path):
+    path = str(tmp_path / "ownership.sqlite3")
+    proof = {"owner_wallet": "0x" + "44" * 20, "signature": "0xsigned", "supplier_url": "https://supplier"}
+    WalletStore(path).set_setting("ownership_proof", proof)
+    assert WalletStore(path).setting("ownership_proof") == proof
+
+
 def test_four_products_keep_missing_execution_evidence_null(tmp_path):
     store = WalletStore(str(tmp_path / "products.sqlite3"))
     collector = EthereumWalletCollector("http://unused", store, Hub(), "ethereum_wallet_trades_v1", 1, 0, 1)

@@ -65,6 +65,9 @@ class WalletStore:
                   supplier_to_buyer_ms REAL, measurement_status TEXT NOT NULL,
                   PRIMARY KEY(event_id,buyer_wallet)
                 );
+                CREATE TABLE IF NOT EXISTS supplier_settings(
+                  key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS wallet_coverage_stats(
                   id INTEGER PRIMARY KEY CHECK(id=1), events INTEGER NOT NULL,
                   first_block INTEGER, last_block INTEGER,
@@ -95,6 +98,19 @@ class WalletStore:
                   WHERE id=1;
                 END;
                 """
+            )
+
+    def setting(self, key: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT value_json FROM supplier_settings WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def set_setting(self, key: str, value: dict) -> None:
+        with self.lock, self.connect() as db:
+            db.execute(
+                """INSERT INTO supplier_settings VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at""",
+                (key, json.dumps(value, separators=(",", ":"), sort_keys=True), utc_now()),
             )
 
     @staticmethod

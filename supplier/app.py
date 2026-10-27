@@ -91,7 +91,7 @@ def ownership_message() -> str:
     )
 
 
-ownership_proof: dict | None = None
+ownership_proof: dict | None = wallet_store.setting("ownership_proof")
 
 
 def current_owner_wallet() -> str:
@@ -192,6 +192,7 @@ def pair_ownership(body: OwnershipIn):
     if recovered.lower() != body.owner_wallet.lower():
         raise HTTPException(401, "Ownership signature does not match the seller wallet")
     ownership_proof = body.model_dump() | {"owner_wallet": body.owner_wallet.lower()}
+    wallet_store.set_setting("ownership_proof", ownership_proof)
     return ownership_proof
 
 
