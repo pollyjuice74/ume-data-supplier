@@ -65,8 +65,50 @@ class WalletStore:
                   supplier_to_buyer_ms REAL, measurement_status TEXT NOT NULL,
                   PRIMARY KEY(event_id,buyer_wallet)
                 );
+                CREATE TABLE IF NOT EXISTS wallet_coverage_stats(
+                  id INTEGER PRIMARY KEY CHECK(id=1), events INTEGER NOT NULL,
+                  first_block INTEGER, last_block INTEGER,
+                  first_timestamp TEXT, last_timestamp TEXT,
+                  inventory_states INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO wallet_coverage_stats
+                SELECT 1,COUNT(*),MIN(block_number),MAX(block_number),
+                       MIN(source_timestamp),MAX(source_timestamp),
+                       (SELECT COUNT(*) FROM wallet_inventory)
+                FROM wallet_events;
+                CREATE TRIGGER IF NOT EXISTS wallet_events_coverage_insert
+                AFTER INSERT ON wallet_events BEGIN
+                  UPDATE wallet_coverage_stats SET
+                    events=events+1,
+                    first_block=CASE
+                      WHEN first_block IS NULL OR NEW.block_number<first_block THEN NEW.block_number
+                      ELSE first_block END,
+                    last_block=CASE
+                      WHEN last_block IS NULL OR NEW.block_number>last_block THEN NEW.block_number
+                      ELSE last_block END,
+                    first_timestamp=CASE
+                      WHEN first_timestamp IS NULL OR NEW.source_timestamp<first_timestamp THEN NEW.source_timestamp
+                      ELSE first_timestamp END,
+                    last_timestamp=CASE
+                      WHEN last_timestamp IS NULL OR NEW.source_timestamp>last_timestamp THEN NEW.source_timestamp
+                      ELSE last_timestamp END
+                  WHERE id=1;
+                END;
                 """
             )
+
+    @staticmethod
+    def _refresh_coverage_stats(db: sqlite3.Connection) -> None:
+        db.execute(
+            """UPDATE wallet_coverage_stats SET
+               events=(SELECT COUNT(*) FROM wallet_events),
+               first_block=(SELECT MIN(block_number) FROM wallet_events),
+               last_block=(SELECT MAX(block_number) FROM wallet_events),
+               first_timestamp=(SELECT MIN(source_timestamp) FROM wallet_events),
+               last_timestamp=(SELECT MAX(source_timestamp) FROM wallet_events),
+               inventory_states=(SELECT COUNT(*) FROM wallet_inventory)
+               WHERE id=1"""
+        )
 
     def checkpoint(self) -> dict | None:
         with self.connect() as db:
@@ -127,6 +169,10 @@ class WalletStore:
                                 event["normalized_at"],
                             ),
                         )
+                        if current is None:
+                            db.execute(
+                                "UPDATE wallet_coverage_stats SET inventory_states=inventory_states+1 WHERE id=1"
+                            )
             db.execute(
                 """INSERT INTO wallet_checkpoint VALUES('ethereum',?,?,?)
                    ON CONFLICT(name) DO UPDATE SET block_number=excluded.block_number,
@@ -164,6 +210,7 @@ class WalletStore:
             ).fetchone()
             if last:
                 db.execute("INSERT INTO wallet_checkpoint VALUES('ethereum',?,?,?)", (*last, utc_now()))
+            self._refresh_coverage_stats(db)
 
     def prune(self, retention_days: int, max_events: int) -> None:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
@@ -175,6 +222,7 @@ class WalletStore:
                    SELECT event_id FROM wallet_events ORDER BY block_number DESC,log_index DESC LIMIT -1 OFFSET ?)""",
                 (max_events,),
             )
+            self._refresh_coverage_stats(db)
 
     def latest(self, limit: int = 100, public: bool = False, event_types: tuple[str, ...] | None = None) -> list[dict]:
         limit = min(max(limit, 1), 50_000)
@@ -196,10 +244,9 @@ class WalletStore:
     def coverage(self) -> dict:
         with self.connect() as db:
             row = db.execute(
-                """SELECT COUNT(*),MIN(block_number),MAX(block_number),
-                   MIN(source_timestamp),MAX(source_timestamp) FROM wallet_events"""
+                """SELECT events,first_block,last_block,first_timestamp,last_timestamp,inventory_states
+                   FROM wallet_coverage_stats WHERE id=1"""
             ).fetchone()
-            inventory = db.execute("SELECT COUNT(*) FROM wallet_inventory").fetchone()[0]
             delivery = db.execute(
                 "SELECT COUNT(*),AVG(supplier_to_buyer_ms),MAX(receipt_at) FROM delivery_receipts"
             ).fetchone()
@@ -209,7 +256,7 @@ class WalletStore:
             "last_block": row[2],
             "from": row[3],
             "to": row[4],
-            "inventory_states": inventory,
+            "inventory_states": row[5],
             "inventory_basis": "WINDOW_RELATIVE",
             "bounded": True,
             "buyer_receipts": delivery[0],

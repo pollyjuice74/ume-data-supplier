@@ -54,6 +54,10 @@ def test_normalize_deduplicate_inventory_and_exports(tmp_path):
         }
     assert balances["0x" + "22" * 20] == "-25"
     assert balances["0x" + "33" * 20] == "25"
+    coverage = store.coverage()
+    assert coverage["events"] == 3
+    assert coverage["inventory_states"] == 2
+    assert coverage["first_block"] == coverage["last_block"] == 10
     assert b"TOKEN_TRANSFER" in store.export("csv", 100)
     assert len(pq.read_table(__import__("io").BytesIO(store.export("parquet", 100)))) == 3
 
