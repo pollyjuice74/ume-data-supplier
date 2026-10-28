@@ -56,6 +56,11 @@ class WalletStore:
                   balance_raw TEXT NOT NULL, updated_event_id TEXT NOT NULL, updated_at TEXT NOT NULL,
                   PRIMARY KEY(chain_id,wallet,asset)
                 );
+                CREATE TABLE IF NOT EXISTS wallet_inventory_baseline(
+                  chain_id INTEGER NOT NULL, wallet TEXT NOT NULL, asset TEXT NOT NULL,
+                  balance_raw TEXT NOT NULL,
+                  PRIMARY KEY(chain_id,wallet,asset)
+                );
                 CREATE TABLE IF NOT EXISTS wallet_checkpoint(
                   name TEXT PRIMARY KEY, block_number INTEGER NOT NULL,
                   block_hash TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -205,11 +210,17 @@ class WalletStore:
             db.execute("DELETE FROM wallet_blocks WHERE block_number>=?", (from_block,))
             db.execute("DELETE FROM wallet_checkpoint")
             db.execute("DELETE FROM wallet_inventory")
+            baseline_rows = db.execute(
+                "SELECT wallet,asset,balance_raw FROM wallet_inventory_baseline"
+            )
+            balances: dict[tuple[str, str], tuple[int, str, str]] = {
+                (row["wallet"], row["asset"]): (int(row["balance_raw"]), "baseline", utc_now())
+                for row in baseline_rows
+            }
             rows = db.execute(
                 """SELECT wallet,asset,amount_raw,event_id,normalized_at FROM wallet_events
                    WHERE event_type='INVENTORY_CHANGE' ORDER BY block_number,log_index,event_id"""
             )
-            balances: dict[tuple[str, str], tuple[int, str, str]] = {}
             for row in rows:
                 key = (row["wallet"], row["asset"])
                 value = balances.get(key, (0, "", ""))[0] + int(row["amount_raw"])
@@ -232,11 +243,43 @@ class WalletStore:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
         with self.lock, self.connect() as db:
             self.behavior_cache.clear()
-            db.execute("DELETE FROM wallet_events WHERE source_timestamp<?", (cutoff,))
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("CREATE TEMP TABLE prune_event_ids(event_id TEXT PRIMARY KEY)")
             db.execute(
-                """DELETE FROM wallet_events WHERE event_id IN (
-                   SELECT event_id FROM wallet_events ORDER BY block_number DESC,log_index DESC LIMIT -1 OFFSET ?)""",
+                "INSERT OR IGNORE INTO prune_event_ids SELECT event_id FROM wallet_events WHERE source_timestamp<?",
+                (cutoff,),
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO prune_event_ids
+                   SELECT event_id FROM wallet_events ORDER BY block_number DESC,log_index DESC LIMIT -1 OFFSET ?""",
                 (max_events,),
+            )
+            removed_rows = db.execute(
+                """SELECT wallet,asset,amount_raw FROM wallet_events
+                   WHERE event_type='INVENTORY_CHANGE'
+                     AND event_id IN (SELECT event_id FROM prune_event_ids)"""
+            )
+            removed: dict[tuple[str, str], int] = {}
+            for row in removed_rows:
+                key = (row["wallet"], row["asset"])
+                removed[key] = removed.get(key, 0) + int(row["amount_raw"])
+            for (wallet, asset), delta in removed.items():
+                previous = db.execute(
+                    "SELECT balance_raw FROM wallet_inventory_baseline WHERE chain_id=1 AND wallet=? AND asset=?",
+                    (wallet, asset),
+                ).fetchone()
+                balance = (int(previous[0]) if previous else 0) + delta
+                db.execute(
+                    """INSERT INTO wallet_inventory_baseline VALUES(1,?,?,?)
+                       ON CONFLICT(chain_id,wallet,asset) DO UPDATE SET balance_raw=excluded.balance_raw""",
+                    (wallet, asset, str(balance)),
+                )
+            db.execute("DELETE FROM wallet_events WHERE event_id IN (SELECT event_id FROM prune_event_ids)")
+            db.execute("DELETE FROM delivery_receipts WHERE event_id NOT IN (SELECT event_id FROM wallet_events)")
+            db.execute(
+                """DELETE FROM wallet_blocks WHERE source_timestamp<? AND block_number<
+                   COALESCE((SELECT block_number FROM wallet_checkpoint WHERE name='ethereum'),0)""",
+                (cutoff,),
             )
             self._refresh_coverage_stats(db)
 
@@ -256,6 +299,23 @@ class WalletStore:
                 ).fetchall()
         events = [json.loads(row[0]) for row in reversed(rows)]
         return events[-5:] if public else events
+
+    def events_after(self, event_id: str, limit: int = 1000) -> list[dict]:
+        """Return retained events strictly after a stable event cursor."""
+        limit = min(max(limit, 1), 50_000)
+        with self.connect() as db:
+            cursor = db.execute(
+                "SELECT block_number,log_index,event_id FROM wallet_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+            if not cursor:
+                raise KeyError("CURSOR_EXPIRED")
+            rows = db.execute(
+                """SELECT payload_json FROM wallet_events
+                   WHERE (block_number,log_index,event_id)>(?,?,?)
+                   ORDER BY block_number,log_index,event_id LIMIT ?""",
+                (cursor["block_number"], cursor["log_index"], cursor["event_id"], limit),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def coverage(self) -> dict:
         with self.connect() as db:

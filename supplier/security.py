@@ -18,9 +18,13 @@ def _b64(data: bytes) -> str:
 class TokenIssuer:
     def __init__(self, secret: str):
         self.secret = secret.encode()
-        self.used: set[str] = set()
+        self.used: dict[str, int] = {}
+        self.max_used = 100_000
 
     def issue(self, wallet: str, audience: str, lifetime: int = 60) -> str:
+        self._prune_used()
+        if len(self.used) >= self.max_used:
+            raise ValueError("single-use token capacity temporarily exhausted")
         payload = {
             "sub": wallet.lower(),
             "aud": audience,
@@ -36,21 +40,31 @@ class TokenIssuer:
         if not hmac.compare_digest(signature, expected):
             raise ValueError("invalid signature")
         payload = json.loads(urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        self._prune_used()
         if payload["aud"] != audience or payload["exp"] <= time.time() or payload["jti"] in self.used:
             raise ValueError("expired, reused, or wrong audience")
         if single_use:
-            self.used.add(payload["jti"])
+            self.used[payload["jti"]] = payload["exp"]
         return payload
+
+    def _prune_used(self) -> None:
+        timestamp = int(time.time())
+        self.used = {jti: expiry for jti, expiry in self.used.items() if expiry > timestamp}
 
 
 class WalletAuth:
     def __init__(self, issuer: TokenIssuer):
         self.issuer = issuer
         self.challenges: dict[str, tuple[str, float]] = {}
+        self.max_challenges = 4096
 
     def challenge(self, wallet: str) -> str:
         if not is_address(wallet):
             raise ValueError("invalid wallet")
+        timestamp = time.time()
+        self.challenges = {key: value for key, value in self.challenges.items() if value[1] > timestamp}
+        if wallet.lower() not in self.challenges and len(self.challenges) >= self.max_challenges:
+            raise ValueError("authentication challenge capacity temporarily exhausted")
         nonce = secrets.token_urlsafe(24)
         message = f"UME supplier authentication\nWallet: {wallet.lower()}\nNonce: {nonce}"
         self.challenges[wallet.lower()] = (message, time.time() + 300)

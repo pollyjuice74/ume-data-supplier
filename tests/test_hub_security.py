@@ -11,7 +11,8 @@ def test_bounded_queue_drops_oldest():
     hub.publish("feed", {"n": 2})
     hub.publish("feed", {"n": 3})
     assert queue.qsize() == 2
-    assert queue.get_nowait() == {"n": 2}
+    assert queue.get_nowait() == {"_ume_control": "DELIVERY_GAP", "feed_id": "feed"}
+    assert queue.get_nowait() == {"n": 3}
     assert hub.dropped["feed"] == 1
 
 

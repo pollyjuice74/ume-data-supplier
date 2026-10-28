@@ -6,7 +6,7 @@ from datetime import datetime
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
@@ -28,7 +28,7 @@ wallet_auth = WalletAuth(issuer)
 entitlements = Entitlements(cfg.rpc_url, cfg.feed_access_address)
 wallet_store = WalletStore(cfg.database_path)
 wallet_collector = EthereumWalletCollector(
-    cfg.ethereum_rpc_url,
+    cfg.ethereum_rpc_urls,
     wallet_store,
     hub,
     "ethereum_wallet_trades_v1",
@@ -39,18 +39,29 @@ wallet_collector = EthereumWalletCollector(
 wallet_collector.retention_days = cfg.retention_days
 wallet_collector.max_events = cfg.max_events
 wallet_task: asyncio.Task | None = None
+retention_task: asyncio.Task | None = None
+
+
+async def retention_loop():
+    while True:
+        await asyncio.to_thread(wallet_store.prune, cfg.retention_days, cfg.max_events)
+        await asyncio.sleep(3600)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global wallet_task
+    global wallet_task, retention_task
     if cfg.enable_live:
         await hub.start()
         wallet_task = asyncio.create_task(wallet_collector.run(), name="ethereum-wallet-collector")
+        retention_task = asyncio.create_task(retention_loop(), name="wallet-retention")
     yield
     if wallet_task:
         wallet_task.cancel()
         await asyncio.gather(wallet_task, return_exceptions=True)
+    if retention_task:
+        retention_task.cancel()
+        await asyncio.gather(retention_task, return_exceptions=True)
     await wallet_collector.close()
     await hub.stop()
 
@@ -128,6 +139,14 @@ def health():
         if wallet["collector_running"] and age is not None and age <= freshness_limit
         else ("DELAYED" if wallet["collector_running"] else "OFFLINE")
     )
+    wallet["rpc_connectivity"] = "OK" if wallet["collector_running"] else "FAILED"
+    wallet["data_freshness"] = "FRESH" if wallet["status"] == "ONLINE" else "STALE"
+    wallet["delivery_health"] = "READY" if wallet["status"] == "ONLINE" else "BLOCKED_STALE_SOURCE"
+    wallet["states"] = {
+        "INGESTING": wallet["collector_running"],
+        "SUPPLIER_HEALTHY": True,
+        "DELIVERABLE": wallet["status"] == "ONLINE",
+    }
     wallet["freshness_threshold_seconds"] = freshness_limit
     for feed_id in WALLET_FEED_IDS:
         feed_health[feed_id] = (
@@ -136,9 +155,11 @@ def health():
             | coverage
             | {
                 "status": wallet["status"],
+                "last_event_at": feed_health[feed_id].get("last_event_at") or last,
                 "freshness_threshold_seconds": freshness_limit,
                 "source_to_supplier_delay_ms": wallet["source_to_supplier_delay_ms"],
                 "source_to_supplier_measurement": wallet["source_to_supplier_measurement"],
+                "states": wallet["states"],
             }
         )
     return {
@@ -154,7 +175,10 @@ def health():
 
 @app.get("/ownership")
 def ownership():
-    if ownership_proof:
+    if (
+        ownership_proof
+        and ownership_proof.get("supplier_url") == cfg.public_url.rstrip("/")
+    ):
         return ownership_proof
     if not cfg.seller_private_key:
         raise HTTPException(503, "Pair this supplier with the connected seller wallet first")
@@ -199,7 +223,7 @@ def pair_ownership(body: OwnershipIn):
 @app.get("/catalog/listings")
 def catalog():
     return [
-        FEEDS[feed_id].public(cfg.public_url, current_owner_wallet()) | {"health": hub.health(feed_id)}
+        FEEDS[feed_id].public(cfg.public_url, current_owner_wallet()) | {"health": health()["feeds"][feed_id]}
         for feed_id in WALLET_FEED_IDS
     ]
 
@@ -234,7 +258,9 @@ def feed_sample(feed_id: str):
     event = hub.latest.get(feed_id) or (projected[-1] if projected else None)
     if not event:
         raise HTTPException(503, "No live sample is available yet")
-    return {"verification_basis": "LIVE_BOUNDED_SAMPLE", "event": event}
+    feed_health = health()["feeds"].get(feed_id, {})
+    basis = "LIVE_BOUNDED_SAMPLE" if feed_health.get("status") == "ONLINE" else "STORED_STALE_SAMPLE"
+    return {"verification_basis": basis, "freshness": feed_health.get("data_freshness"), "event": event}
 
 
 @app.post("/auth/challenge")
@@ -273,7 +299,7 @@ def feed_schema(feed_id: str):
 
 
 @app.get("/feeds/{feed_id}/sse")
-async def sse(feed_id: str, ticket: str = Query(...)):
+async def sse(request: Request, feed_id: str, ticket: str = Query(...), cursor: str | None = Query(None)):
     if feed_id not in FEEDS:
         raise HTTPException(404, "Unknown feed")
     try:
@@ -286,12 +312,36 @@ async def sse(feed_id: str, ticket: str = Query(...)):
     async def events():
         queue = hub.subscribe(feed_id)
         try:
-            replay = product_rows(feed_id, wallet_store.latest(500), wallet_store) if feed_id in WALLET_FEED_IDS else []
-            for item in replay[-25:]:
+            requested_cursor = cursor or request.headers.get("last-event-id")
+            if requested_cursor and feed_id in WALLET_FEED_IDS:
+                try:
+                    raw_replay = wallet_store.events_after(requested_cursor, cfg.export_max_rows)
+                except KeyError:
+                    yield 'event: cursor_expired\ndata: {"code":"CURSOR_EXPIRED"}\n\n'
+                    return
+                replay = product_rows(feed_id, raw_replay, wallet_store)
+            else:
+                replay = (
+                    product_rows(feed_id, wallet_store.latest(500), wallet_store)
+                    if feed_id in WALLET_FEED_IDS
+                    else []
+                )
+                replay = replay[-25:]
+            delivered = {requested_cursor} if requested_cursor else set()
+            for item in replay:
+                if item["event_id"] in delivered:
+                    continue
+                delivered.add(item["event_id"])
                 yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(item)}\n\n"
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(), 15)
+                    if item.get("_ume_control") == "DELIVERY_GAP":
+                        yield 'event: delivery_gap\ndata: {"code":"DELIVERY_GAP","reconnect_required":true}\n\n'
+                        return
+                    if item["event_id"] in delivered:
+                        continue
+                    delivered.add(item["event_id"])
                     yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(item)}\n\n"
                 except TimeoutError:
                     if not await entitlements.active(claim["sub"], feed_id):

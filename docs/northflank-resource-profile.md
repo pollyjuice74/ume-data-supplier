@@ -35,9 +35,9 @@ curl -fsS http://127.0.0.1:18092/catalog/listings
 ```
 
 For Northflank keep `SUPPLIER_ENABLE_EXCHANGE_FEEDS=false`, mount durable storage at `/app/data`, set
-`SUPPLIER_DATABASE_PATH=/app/data/supplier.sqlite3`, and retain the default 64-event buyer queue. A slow buyer loses
-the oldest queued event intentionally; `dropped_events` exposes that backpressure loss. SQLite remains the replay
-source, so reconnecting buyers can receive the bounded recent replay without keeping history in RAM.
+`SUPPLIER_DATABASE_PATH=/app/data/supplier.sqlite3`, and retain the default 64-event buyer queue. Backpressure now
+terminates the connection with an explicit `DELIVERY_GAP`; the buyer reconnects from its last event cursor instead
+of silently losing queued events. SQLite supplies retained replay without keeping history in RAM.
 
 Parquet generation loads PyArrow on demand. It is no longer resident during ordinary indexing, but a large export can
 temporarily increase memory. The production default is therefore capped at 10,000 rows per request.

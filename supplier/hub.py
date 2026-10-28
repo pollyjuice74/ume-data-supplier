@@ -64,9 +64,14 @@ class FeedHub:
                 times.popleft()
         for queue in tuple(self.subscribers[feed_id]):
             if queue.full():
-                queue.get_nowait()
+                while not queue.empty():
+                    queue.get_nowait()
                 self.dropped[feed_id] += 1
-            queue.put_nowait(event)
+                queue.put_nowait({"_ume_control": "DELIVERY_GAP", "feed_id": feed_id})
+                if queue.maxsize > 1:
+                    queue.put_nowait(event)
+            else:
+                queue.put_nowait(event)
 
     def health(self, feed_id: str) -> dict:
         last = self.last_event.get(feed_id)

@@ -2,7 +2,9 @@ import asyncio
 import threading
 from datetime import UTC, datetime
 
+import httpx
 import pyarrow.parquet as pq
+import pytest
 from fastapi.testclient import TestClient
 
 from supplier import app as supplier_app
@@ -106,6 +108,24 @@ def test_public_metadata_health_and_protected_history(monkeypatch, tmp_path):
         assert response.headers["content-type"].startswith("text/csv")
 
 
+def test_sse_reports_expired_cursor_instead_of_silent_gap(monkeypatch, tmp_path):
+    store = WalletStore(str(tmp_path / "cursor-sse.sqlite3"))
+    monkeypatch.setattr(supplier_app, "wallet_store", store)
+    monkeypatch.setattr(supplier_app.cfg, "enable_live", False)
+
+    async def active(wallet, feed):
+        return True
+
+    monkeypatch.setattr(supplier_app.entitlements, "active", active)
+    feed = "ethereum_mirror_candidates_v1"
+    ticket = supplier_app.issuer.issue("0x" + "44" * 20, f"stream:{feed}", 60)
+    with TestClient(supplier_app.app) as client:
+        response = client.get(f"/feeds/{feed}/sse", params={"ticket": ticket, "cursor": "pruned-event"})
+    assert response.status_code == 200
+    assert "event: cursor_expired" in response.text
+    assert "CURSOR_EXPIRED" in response.text
+
+
 def test_delivery_receipt_is_explicit_about_clock_quality(tmp_path):
     store = WalletStore(str(tmp_path / "events.sqlite3"))
     collector = EthereumWalletCollector("http://unused", store, Hub(), "ethereum-wallet-trading-v1", 1, 0, 1)
@@ -136,6 +156,70 @@ def test_four_products_keep_missing_execution_evidence_null(tmp_path):
     assert mirror["execution_status"] == "MISSED_NO_QUOTE"
     assert mirror["estimated_pnl"] is None and mirror["estimated_cost"] is None
     assert len(WALLET_FEED_IDS) == 4
+
+
+def test_events_after_cursor_is_ordered_and_rejects_unknown_cursor(tmp_path):
+    store = WalletStore(str(tmp_path / "cursor.sqlite3"))
+    collector = EthereumWalletCollector("http://unused", store, Hub(), "ethereum_wallet_trades_v1", 1, 0, 1)
+    events = collector.normalize(
+        transfer_log(), "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00"
+    )
+    store.ingest_block(block(), events)
+    expected = sorted(events, key=lambda item: (item["log_index"], item["event_id"]))
+    assert [row["event_id"] for row in store.events_after(expected[0]["event_id"])] == [
+        row["event_id"] for row in expected[1:]
+    ]
+    with pytest.raises(KeyError, match="CURSOR_EXPIRED"):
+        store.events_after("not-retained")
+
+
+def test_pruned_inventory_baseline_survives_reorg_rebuild(tmp_path):
+    store = WalletStore(str(tmp_path / "baseline.sqlite3"))
+    collector = EthereumWalletCollector("http://unused", store, Hub(), "ethereum_wallet_trades_v1", 1, 0, 1)
+    first = collector.normalize(
+        transfer_log(), "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00"
+    )
+    store.ingest_block(block(), first)
+    second_log = transfer_log() | {
+        "blockNumber": hex(11),
+        "blockHash": "0x" + "bc" * 32,
+        "transactionHash": "0x" + "cd" * 32,
+    }
+    second = collector.normalize(
+        second_log, "2026-01-01T00:01:00+00:00", "2026-01-01T00:01:01+00:00"
+    )
+    second_block = block(11) | {"hash": "0x" + "bc" * 32, "parent_hash": block()["hash"]}
+    store.ingest_block(second_block, second)
+    store.prune(retention_days=365, max_events=3)
+    store.rewind(11)
+    with store.connect() as db:
+        balances = {row["wallet"]: row["balance_raw"] for row in db.execute("SELECT * FROM wallet_inventory")}
+    assert balances["0x" + "22" * 20] == "-25"
+    assert balances["0x" + "33" * 20] == "25"
+
+
+async def test_collector_falls_back_after_forbidden_rpc(tmp_path):
+    store = WalletStore(str(tmp_path / "fallback.sqlite3"))
+    collector = EthereumWalletCollector(
+        ["https://primary.invalid", "https://fallback.invalid"],
+        store,
+        Hub(),
+        "ethereum_wallet_trades_v1",
+        1,
+        0,
+        1,
+    )
+
+    async def handler(request):
+        if request.url.host == "primary.invalid":
+            return httpx.Response(403)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 2, "result": "0x2a"})
+
+    await collector.client.aclose()
+    collector.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    assert await collector.rpc("eth_blockNumber", []) == "0x2a"
+    assert collector.active_provider_index == 1
+    await collector.close()
 
 
 async def test_sqlite_ingestion_does_not_block_health_and_sse_event_loop(monkeypatch, tmp_path):
