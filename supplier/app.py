@@ -182,6 +182,21 @@ def health():
     }
 
 
+@app.get("/health/live")
+def live_health():
+    """Liveness probe that fails when ingestion is not producing fresh data."""
+    snapshot = health()
+    feed = snapshot["feeds"]["ethereum_mirror_candidates_v1"]
+    if snapshot["status"] != "ok" or feed["status"] != "ONLINE" or not feed["websocket_connected"]:
+        raise HTTPException(503, "Ethereum live ingestion is not fresh")
+    return {
+        "status": "ok",
+        "block": feed["last_successfully_ingested_block"],
+        "head": feed["current_chain_head"],
+        "last_success_at": feed["last_success_at"],
+    }
+
+
 @app.get("/ownership")
 def ownership():
     if (
