@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -111,7 +112,9 @@ def ownership_message() -> str:
     )
 
 
-ownership_proof: dict | None = wallet_store.setting("ownership_proof")
+ownership_proof: dict | None = (
+    json.loads(cfg.ownership_proof_json) if cfg.ownership_proof_json else wallet_store.setting("ownership_proof")
+)
 
 
 def current_owner_wallet() -> str:
@@ -394,8 +397,6 @@ async def sse(request: Request, feed_id: str, ticket: str = Query(...), cursor: 
 
 
 def hub_json(value: dict) -> str:
-    import json
-
     return json.dumps(value, separators=(",", ":"))
 
 

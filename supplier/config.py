@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     ume_api_url: str = "http://127.0.0.1:8000"
     seller_private_key: str = ""
     owner_wallet: str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+    ownership_proof_json: str = ""
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     database_path: str = "./data/supplier.sqlite3"
     storage_mode: str = "sqlite"
