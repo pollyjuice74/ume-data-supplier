@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from .catalog import FEEDS
 from .config import settings
 from .hub import FeedHub
+from .live_store import LiveWalletStore
 from .security import Entitlements, TokenIssuer, WalletAuth
 from .wallet_collector import EthereumWalletCollector
 from .wallet_products import WALLET_FEED_IDS
@@ -26,7 +27,11 @@ hub = FeedHub(cfg.queue_size, cfg.rate_window_max_events, cfg.enable_exchange_fe
 issuer = TokenIssuer(cfg.session_secret)
 wallet_auth = WalletAuth(issuer)
 entitlements = Entitlements(cfg.rpc_url, cfg.feed_access_address)
-wallet_store = WalletStore(cfg.database_path)
+wallet_store = (
+    LiveWalletStore(cfg.live_window_events)
+    if cfg.storage_mode.lower() == "memory"
+    else WalletStore(cfg.database_path)
+)
 wallet_collector = EthereumWalletCollector(
     cfg.ethereum_rpc_urls,
     wallet_store,
@@ -57,7 +62,8 @@ async def lifespan(_: FastAPI):
     if cfg.enable_live:
         await hub.start()
         wallet_task = asyncio.create_task(wallet_collector.run(), name="ethereum-wallet-collector")
-        retention_task = asyncio.create_task(retention_loop(), name="wallet-retention")
+        if not getattr(wallet_store, "ephemeral", False):
+            retention_task = asyncio.create_task(retention_loop(), name="wallet-retention")
     yield
     if wallet_task:
         wallet_task.cancel()
@@ -244,7 +250,10 @@ def feed_detail(feed_id: str):
     return feed.public(cfg.public_url, current_owner_wallet()) | {
         "source": {"name": feed.source, "symbol": feed.symbol},
         "coverage": coverage,
-        "available_formats": ["SSE", "JSON", "CSV", "Parquet"] if feed_id in WALLET_FEED_IDS else ["WebSocket"],
+        "available_formats": (
+            ["SSE"] if getattr(wallet_store, "ephemeral", False) else ["SSE", "JSON", "CSV", "Parquet"]
+        )
+        if feed_id in WALLET_FEED_IDS else ["WebSocket"],
         "disclaimer": "On-chain observations only. Test-USDC marketplace terms are not real revenue.",
     }
 
@@ -335,7 +344,10 @@ async def sse(request: Request, feed_id: str, ticket: str = Query(...), cursor: 
                 if item["event_id"] in delivered:
                     continue
                 delivered.add(item["event_id"])
-                delivered_item = item | {"supplier_delivery_at": utc_now()}
+                delivered_item = item | {
+                    "supplier_delivery_at": utc_now(),
+                    "delivery_class": "REPLAY_CURRENT_PROCESS_WINDOW",
+                }
                 yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(delivered_item)}\n\n"
             while True:
                 try:
@@ -350,6 +362,8 @@ async def sse(request: Request, feed_id: str, ticket: str = Query(...), cursor: 
                     if item["event_id"] in delivered:
                         continue
                     delivered.add(item["event_id"])
+                    if len(delivered) > cfg.live_window_events:
+                        delivered = {item["event_id"]}
                     delivered_item = item | {"supplier_delivery_at": utc_now()}
                     yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(delivered_item)}\n\n"
                 except TimeoutError:
@@ -376,6 +390,8 @@ async def history(feed_id: str, fmt: str, auth: dict = Depends(session)):
         raise HTTPException(404, "Unknown export")
     if not await entitlements.active(auth["sub"], feed_id):
         raise HTTPException(403, "Active on-chain entitlement required")
+    if getattr(wallet_store, "ephemeral", False):
+        raise HTTPException(410, "Historical exports are unavailable: this is a live-only feed")
     media = {"json": "application/json", "csv": "text/csv", "parquet": "application/vnd.apache.parquet"}[fmt]
     return Response(
         wallet_store.export_rows(product_rows(feed_id, wallet_store.latest(cfg.export_max_rows), wallet_store), fmt),

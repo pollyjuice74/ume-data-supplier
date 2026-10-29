@@ -1,0 +1,42 @@
+name: Production live supplier health
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-live-ingestion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Require fresh WebSocket ingestion
+        env:
+          HEALTH_URL: https://p01--ume-data-supplier-service1--4bt4m287psw5.code.run/health
+        run: |
+          curl --fail --silent --show-error --max-time 20 "$HEALTH_URL" > /tmp/health.json
+          python3 - <<'PY'
+          import datetime
+          import json
+
+          with open("/tmp/health.json", encoding="utf-8") as source:
+              payload = json.load(source)
+          feed = payload["feeds"]["ethereum_mirror_candidates_v1"]
+          assert payload["status"] == "ok", payload
+          assert feed["status"] == "ONLINE", feed
+          assert feed["collector_running"] is True, feed
+          assert feed["websocket_connected"] is True, feed
+          assert feed["last_successfully_ingested_block"] is not None, feed
+          observed = datetime.datetime.fromisoformat(feed["last_success_at"])
+          age = (datetime.datetime.now(datetime.timezone.utc) - observed).total_seconds()
+          assert age < 180, {"last_success_age_seconds": age, "feed": feed}
+          print(json.dumps({
+              "status": feed["status"],
+              "block": feed["last_successfully_ingested_block"],
+              "head": feed["current_chain_head"],
+              "last_success_age_seconds": age,
+          }))
+          PY

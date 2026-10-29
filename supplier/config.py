@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     owner_wallet: str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     database_path: str = "./data/supplier.sqlite3"
+    storage_mode: str = "sqlite"
+    live_window_events: int = Field(5000, ge=100, le=100_000)
     ethereum_rpc_url: str = "https://ethereum-rpc.publicnode.com"
     ethereum_fallback_rpc_urls: str = ""
     ethereum_ws_url: str = ""

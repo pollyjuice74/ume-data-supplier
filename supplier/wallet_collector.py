@@ -344,6 +344,9 @@ class EthereumWalletCollector:
         self.last_success_at = utc_now()
         self.hub.connected[self.feed_id] = True
         for feed_id, item in projected:
+            item["delivery_class"] = (
+                "LIVE_PROVIDER_OBSERVED" if item.get("provider_received_at") else "RECONCILED_CONFIRMED"
+            )
             self.hub.connected[feed_id] = True
             self.hub.publish(feed_id, item)
             published = datetime.fromisoformat(item.get("published_at", utc_now()))
