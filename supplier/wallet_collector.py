@@ -1,10 +1,14 @@
 import asyncio
 import hashlib
+import json
+import logging
 import random
 import time
+from collections import OrderedDict, deque
 from datetime import UTC, datetime
 
 import httpx
+import websockets
 from eth_utils import keccak
 
 from .wallet_products import WALLET_FEED_IDS, project
@@ -14,6 +18,7 @@ TRANSFER = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
 SWAP_V2 = "0x" + keccak(text="Swap(address,uint256,uint256,uint256,uint256,address)").hex()
 SWAP_V3 = "0x" + keccak(text="Swap(address,address,int256,int256,uint160,uint128,int24)").hex()
 ZERO = "0x" + "0" * 40
+log = logging.getLogger("supplier.ethereum")
 
 
 class CollectorRpcError(RuntimeError):
@@ -49,12 +54,18 @@ class EthereumWalletCollector:
         poll_seconds: float,
         confirmations: int,
         backfill: int,
+        websocket_urls: list[str] | None = None,
+        reconcile_seconds: float = 30,
+        subscribe_pending: bool = False,
     ):
         self.rpc_urls = [rpc_url] if isinstance(rpc_url, str) else list(rpc_url)
         if not self.rpc_urls:
             raise ValueError("at least one Ethereum ingestion RPC is required")
         self.store, self.hub, self.feed_id = store, hub, feed_id
         self.poll_seconds, self.confirmations, self.backfill = poll_seconds, confirmations, backfill
+        self.websocket_urls = list(websocket_urls or [])
+        self.reconcile_seconds = reconcile_seconds
+        self.subscribe_pending = subscribe_pending
         self.client = httpx.AsyncClient(timeout=30, headers={"User-Agent": "ume-data-supplier/0.2"})
         self.counter = 0
         self.running = False
@@ -68,6 +79,17 @@ class EthereumWalletCollector:
         self.last_successful_block: int | None = None
         self.retry_in_seconds: float | None = None
         self.retry_max_seconds = 60.0
+        self.ws_connected = False
+        self.ws_provider_index: int | None = None
+        self.ws_reconnects = 0
+        self.ws_last_message_at: str | None = None
+        self.pending_subscription_active = False
+        self._collect_lock = asyncio.Lock()
+        self._head_reconcile_task: asyncio.Task | None = None
+        self._provider_receipts: dict[tuple[str, str, int], str] = {}
+        self._pool_tokens: OrderedDict[str, tuple[str, str] | None] = OrderedDict()
+        self._latency_observation_to_publication_ms: deque[float] = deque(maxlen=4096)
+        self.reorgs = 0
 
     async def close(self):
         await self.client.aclose()
@@ -114,6 +136,12 @@ class EthereumWalletCollector:
         raise CollectorRpcError(category, f"all {len(self.rpc_urls)} configured ingestion RPC providers failed")
 
     async def run(self):
+        if self.websocket_urls:
+            await self._run_event_driven()
+            return
+        await self._run_polling()
+
+    async def _run_polling(self):
         delay = 1.0
         while True:
             try:
@@ -132,7 +160,117 @@ class EthereumWalletCollector:
                 await asyncio.sleep(wait)
                 delay = min(delay * 2, self.retry_max_seconds)
 
+    async def _run_event_driven(self):
+        """Use subscriptions as the low-latency trigger and HTTP as the authority."""
+        subscription = asyncio.create_task(self._subscription_loop(), name="ethereum-subscriptions")
+        try:
+            # Reconcile immediately, then periodically even while the socket is healthy.
+            while True:
+                try:
+                    await self.collect_once()
+                    self.running, self.error, self.error_category = True, None, None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.running, self.error = False, str(exc)
+                    self.error_category = getattr(exc, "category", "COLLECTOR_STALLED")
+                await asyncio.sleep(self.reconcile_seconds)
+        finally:
+            subscription.cancel()
+            await asyncio.gather(subscription, return_exceptions=True)
+
+    async def _subscription_loop(self):
+        delay = 1.0
+        while True:
+            for index, url in enumerate(self.websocket_urls):
+                try:
+                    async with websockets.connect(
+                        url, ping_interval=20, ping_timeout=20, max_queue=128, open_timeout=15
+                    ) as ws:
+                        self.ws_connected, self.ws_provider_index = True, index
+                        self.ws_last_message_at, delay = utc_now(), 1.0
+                        subscriptions: dict[str, str] = {}
+                        requests = [
+                            (1, "newHeads", ["newHeads"]),
+                            (2, "logs", ["logs", {"topics": [[TRANSFER, SWAP_V2, SWAP_V3]]}]),
+                        ]
+                        if self.subscribe_pending:
+                            requests.append((3, "pending", ["newPendingTransactions"]))
+                        for request_id, name, params in requests:
+                            request = {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "method": "eth_subscribe",
+                                "params": params,
+                            }
+                            await ws.send(json.dumps(request))
+                            response = json.loads(await asyncio.wait_for(ws.recv(), 15))
+                            if response.get("error"):
+                                if name == "pending":
+                                    self.pending_subscription_active = False
+                                    continue
+                                raise CollectorRpcError("COLLECTOR_WS_SUBSCRIBE", f"{name} subscription rejected")
+                            subscriptions[str(response.get("result"))] = name
+                            if name == "pending":
+                                self.pending_subscription_active = True
+                        async for raw in ws:
+                            self.ws_last_message_at = utc_now()
+                            message = json.loads(raw)
+                            params = message.get("params") or {}
+                            name = subscriptions.get(str(params.get("subscription")))
+                            result = params.get("result")
+                            if name == "logs" and isinstance(result, dict):
+                                self._remember_provider_receipt(result)
+                            elif name == "newHeads" and isinstance(result, dict):
+                                raw_number = result.get("number")
+                                if raw_number:
+                                    self.chain_head = quantity(raw_number)
+                                # Coalesce bursts. HTTP reconciliation supplies canonical logs,
+                                # fills gaps, applies confirmations, and detects reorgs.
+                                if not self._collect_lock.locked() and (
+                                    self._head_reconcile_task is None or self._head_reconcile_task.done()
+                                ):
+                                    self._head_reconcile_task = asyncio.create_task(
+                                        self._reconcile_from_head(), name="ethereum-head-reconcile"
+                                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.ws_connected = False
+                    self.ws_reconnects += 1
+                    log.warning("ethereum_ws_disconnected provider=%s error=%s", index, type(exc).__name__)
+                    continue
+            self.ws_connected = False
+            await asyncio.sleep(delay + random.uniform(0, min(1.0, delay / 4)))
+            delay = min(delay * 2, self.retry_max_seconds)
+
+    async def _reconcile_from_head(self) -> None:
+        """Reconcile a subscription head without leaking background task errors."""
+        try:
+            await self.collect_once()
+            self.running, self.error, self.error_category = True, None, None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.running, self.error = False, str(exc)
+            self.error_category = getattr(exc, "category", "COLLECTOR_STALLED")
+            log.warning("ethereum_head_reconciliation_failed category=%s", self.error_category)
+
+    def _remember_provider_receipt(self, item: dict) -> None:
+        try:
+            key = (item["blockHash"].lower(), item["transactionHash"].lower(), quantity(item["logIndex"]))
+        except (KeyError, TypeError, ValueError):
+            return
+        self._provider_receipts[key] = utc_now()
+        if len(self._provider_receipts) > 20_000:
+            for old in list(self._provider_receipts)[:5_000]:
+                self._provider_receipts.pop(old, None)
+
     async def collect_once(self):
+        async with self._collect_lock:
+            return await self._collect_once_locked()
+
+    async def _collect_once_locked(self):
         raw_head = quantity(await self.rpc("eth_blockNumber", []))
         self.chain_head = raw_head
         tip = raw_head - self.confirmations
@@ -144,23 +282,53 @@ class EthereumWalletCollector:
         if checkpoint:
             canonical = await self.rpc("eth_getBlockByNumber", [hex(checkpoint["block_number"]), False])
             if not canonical or canonical["hash"].lower() != checkpoint["block_hash"]:
+                self.reorgs += 1
+                self._publish_control(
+                    "REORG_CORRECTION",
+                    {"rewind_from_block": max(0, checkpoint["block_number"] - self.backfill)},
+                )
                 await asyncio.to_thread(self.store.rewind, max(0, checkpoint["block_number"] - self.backfill))
                 checkpoint = await asyncio.to_thread(self.store.checkpoint)
         start = checkpoint["block_number"] + 1 if checkpoint else max(0, tip - self.backfill + 1)
+        inserted_count = 0
         for number in range(start, tip + 1):
-            await self.collect_block(number)
+            inserted_count += len(await self.collect_block(number))
+        return inserted_count
+
+    def _publish_control(self, kind: str, details: dict) -> None:
+        for feed_id in WALLET_FEED_IDS:
+            self.hub.publish(feed_id, {"_ume_control": kind, "feed_id": feed_id, **details, "timestamp": utc_now()})
 
     async def collect_block(self, number: int):
         observed = utc_now()
-        block = await self.rpc("eth_getBlockByNumber", [hex(number), False])
+        block = await self.rpc("eth_getBlockByNumber", [hex(number), True])
         if not block:
             raise RuntimeError(f"Ethereum block {number} unavailable")
         query = {"fromBlock": hex(number), "toBlock": hex(number), "topics": [[TRANSFER, SWAP_V2, SWAP_V3]]}
         logs = await self.rpc("eth_getLogs", [query]) or []
+        swap_pools = {
+            item["address"].lower()
+            for item in logs
+            if item.get("topics") and item["topics"][0].lower() in {SWAP_V2, SWAP_V3}
+        }
+        await self._resolve_pool_tokens(swap_pools, number)
         timestamp = datetime.fromtimestamp(quantity(block["timestamp"]), UTC).isoformat()
+        transaction_senders = {
+            item["hash"].lower(): item["from"].lower()
+            for item in block.get("transactions", [])
+            if isinstance(item, dict) and item.get("hash") and item.get("from")
+        }
         events = []
         for log in logs:
-            events.extend(self.normalize(log, timestamp, observed))
+            key = (log["blockHash"].lower(), log["transactionHash"].lower(), quantity(log["logIndex"]))
+            provider_received_at = self._provider_receipts.pop(key, None)
+            tokens = self._pool_tokens.get(log["address"].lower())
+            if tokens:
+                log = log | {"_token0": tokens[0], "_token1": tokens[1]}
+            sender = transaction_senders.get(log["transactionHash"].lower())
+            if sender:
+                log = log | {"_transaction_sender": sender}
+            events.extend(self.normalize(log, timestamp, observed, provider_received_at))
         inserted, projected = await asyncio.to_thread(
             self._persist_and_project,
             {
@@ -178,7 +346,38 @@ class EthereumWalletCollector:
         for feed_id, item in projected:
             self.hub.connected[feed_id] = True
             self.hub.publish(feed_id, item)
+            published = datetime.fromisoformat(item.get("published_at", utc_now()))
+            if item.get("provider_received_at"):
+                provider = datetime.fromisoformat(item["provider_received_at"])
+                self._latency_observation_to_publication_ms.append(
+                    max(0, (published - provider).total_seconds() * 1000)
+                )
         return inserted
+
+    async def _resolve_pool_tokens(self, pools: set[str], block_number: int) -> None:
+        """Resolve pool assets without making enrichment a correctness dependency."""
+        semaphore = asyncio.Semaphore(8)
+
+        async def resolve(pool: str) -> None:
+            if pool in self._pool_tokens:
+                self._pool_tokens.move_to_end(pool)
+                return
+            value: tuple[str, str] | None = None
+            try:
+                async with semaphore:
+                    token0, token1 = await asyncio.gather(
+                        self.rpc("eth_call", [{"to": pool, "data": "0x0dfe1681"}, hex(block_number)]),
+                        self.rpc("eth_call", [{"to": pool, "data": "0xd21220a7"}, hex(block_number)]),
+                    )
+                if len(token0) >= 42 and len(token1) >= 42:
+                    value = ("0x" + token0[-40:].lower(), "0x" + token1[-40:].lower())
+            except Exception as exc:
+                log.info("pool_token_metadata_unavailable pool=%s error=%s", pool, type(exc).__name__)
+            self._pool_tokens[pool] = value
+            if len(self._pool_tokens) > 10_000:
+                self._pool_tokens.popitem(last=False)
+
+        await asyncio.gather(*(resolve(pool) for pool in pools))
 
     def _persist_and_project(self, block: dict, events: list[dict]) -> tuple[list[dict], list[tuple[str, dict]]]:
         """Perform all blocking SQLite work in one worker-thread call."""
@@ -191,7 +390,9 @@ class EthereumWalletCollector:
                     projected.append((feed_id, item))
         return inserted, projected
 
-    def normalize(self, log: dict, source_timestamp: str, observed: str) -> list[dict]:
+    def normalize(
+        self, log: dict, source_timestamp: str, observed: str, provider_received_at: str | None = None
+    ) -> list[dict]:
         topics = [item.lower() for item in log.get("topics", [])]
         head = topics[0] if topics else ""
         base = {
@@ -201,12 +402,14 @@ class EthereumWalletCollector:
             "transaction_hash": log["transactionHash"].lower(),
             "log_index": quantity(log["logIndex"]),
             "source_timestamp": source_timestamp,
+            "provider_received_at": provider_received_at,
             "supplier_observed_at": observed,
             "normalized_at": utc_now(),
             "published_at": utc_now(),
             "provenance": {
                 "source": "ethereum_rpc",
                 "observation": "canonical_log",
+                "transport": "websocket_trigger_http_verified" if provider_received_at else "http_reconciliation",
                 "contract": log["address"].lower(),
             },
         }
@@ -239,20 +442,36 @@ class EthereumWalletCollector:
         data = words(log.get("data", "0x"))
         if head == SWAP_V2 and len(topics) >= 3 and len(data) >= 4:
             return [
-                event("UNISWAP_V2_SWAP", topic_address(topics[1]), topic_address(topics[2]), suffix="swap")
+                event(
+                    "UNISWAP_V2_SWAP",
+                    log.get("_transaction_sender"),
+                    topic_address(topics[2]),
+                    suffix="swap",
+                )
                 | {
                     "amount0_raw": str(data[2] - data[0]),
                     "amount1_raw": str(data[3] - data[1]),
                     "pool": log["address"].lower(),
+                    "token0": log.get("_token0"),
+                    "token1": log.get("_token1"),
                 }
             ]
         if head == SWAP_V3 and len(topics) >= 3 and len(data) >= 2:
             return [
-                event("UNISWAP_V3_SWAP", topic_address(topics[1]), topic_address(topics[2]), suffix="swap")
+                event(
+                    "UNISWAP_V3_SWAP",
+                    log.get("_transaction_sender"),
+                    topic_address(topics[2]),
+                    suffix="swap",
+                )
                 | {
-                    "amount0_raw": str(signed(data[0])),
-                    "amount1_raw": str(signed(data[1])),
+                    # V3 logs report pool deltas. Negating them makes both V2
+                    # and V3 fields wallet-relative: negative spent, positive received.
+                    "amount0_raw": str(-signed(data[0])),
+                    "amount1_raw": str(-signed(data[1])),
                     "pool": log["address"].lower(),
+                    "token0": log.get("_token0"),
+                    "token1": log.get("_token1"),
                 }
             ]
         return []
@@ -260,6 +479,13 @@ class EthereumWalletCollector:
     def health(self) -> dict:
         checkpoint = self.store.checkpoint()
         indexed = checkpoint["block_number"] if checkpoint else self.last_successful_block
+        latency = sorted(self._latency_observation_to_publication_ms)
+
+        def percentile(p: float) -> float | None:
+            if not latency:
+                return None
+            return latency[min(len(latency) - 1, int((len(latency) - 1) * p))]
+
         return {
             "collector_running": self.running,
             "error_category": self.error_category,
@@ -275,4 +501,18 @@ class EthereumWalletCollector:
             ),
             "last_success_at": self.last_success_at,
             "retry_in_seconds": self.retry_in_seconds,
+            "ingestion_mode": "WEBSOCKET_WITH_HTTP_RECONCILIATION" if self.websocket_urls else "HTTP_POLLING",
+            "websocket_connected": self.ws_connected,
+            "websocket_provider": self.ws_provider_index,
+            "websocket_reconnects": self.ws_reconnects,
+            "websocket_last_message_at": self.ws_last_message_at,
+            "pending_subscription_active": self.pending_subscription_active,
+            "reorgs_detected": self.reorgs,
+            "observation_to_publication_latency_ms": {
+                "sample_size": len(latency),
+                "p50": percentile(0.50),
+                "p95": percentile(0.95),
+                "p99": percentile(0.99),
+                "measurement": "WEBSOCKET_PROVIDER_RECEIPT_TO_SUPPLIER_PUBLICATION_MEASURED",
+            },
         }

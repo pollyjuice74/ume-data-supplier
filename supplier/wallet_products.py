@@ -18,12 +18,26 @@ def _provenance(event: dict, derivation: str, limitations: list[str] | None = No
     }
 
 
+def _delivery_timestamps(event: dict) -> dict:
+    return {
+        "block_timestamp": event["source_timestamp"],
+        "provider_received_at": event.get("provider_received_at"),
+        "collector_received_at": event["supplier_observed_at"],
+        "normalized_at": event["normalized_at"],
+        "published_at": event["published_at"],
+    }
+
+
 def trade(event: dict) -> dict | None:
     if event["event_type"] not in SWAPS:
         return None
     amount0, amount1 = int(event["amount0_raw"]), int(event["amount1_raw"])
-    incoming = next((abs(x) for x in (amount0, amount1) if x > 0), None)
-    outgoing = next((abs(x) for x in (amount0, amount1) if x < 0), None)
+    received = next((abs(x) for x in (amount0, amount1) if x > 0), None)
+    spent = next((abs(x) for x in (amount0, amount1) if x < 0), None)
+    tokens = (event.get("token0"), event.get("token1"))
+    token_in = next((tokens[index] for index, amount in enumerate((amount0, amount1)) if amount < 0), None)
+    token_out = next((tokens[index] for index, amount in enumerate((amount0, amount1)) if amount > 0), None)
+    limitations = [] if token_in and token_out else ["POOL_TOKEN_METADATA_NOT_RESOLVED"]
     return {
         "event_id": event["event_id"],
         "chain_id": event["chain_id"],
@@ -33,12 +47,12 @@ def trade(event: dict) -> dict | None:
         "log_index": event["log_index"],
         "wallet": event.get("wallet"),
         "pool": event["pool"],
-        "token_in": None,
-        "token_out": None,
-        "amount_in_raw": str(incoming) if incoming is not None else None,
-        "amount_out_raw": str(outgoing) if outgoing is not None else None,
-        "provenance": _provenance(event, "observed_swap_log", ["POOL_TOKEN_METADATA_NOT_RESOLVED"]),
-    }
+        "token_in": token_in,
+        "token_out": token_out,
+        "amount_in_raw": str(spent) if spent is not None else None,
+        "amount_out_raw": str(received) if received is not None else None,
+        "provenance": _provenance(event, "observed_swap_log", limitations),
+    } | _delivery_timestamps(event)
 
 
 def inventory(event: dict) -> dict | None:
@@ -55,7 +69,7 @@ def inventory(event: dict) -> dict | None:
         "relative_inventory_raw": event.get("relative_inventory_raw"),
         "balance_scope": "WINDOW_RELATIVE",
         "provenance": _provenance(event, "exact_transfer_delta", ["INDEXED_WINDOW_NOT_COMPLETE_BALANCE"]),
-    }
+    } | _delivery_timestamps(event)
 
 
 def behavior(event: dict, aggregate: dict) -> dict | None:
@@ -80,13 +94,16 @@ def behavior(event: dict, aggregate: dict) -> dict | None:
         "lead_lag_metrics": None,
         "quality_flags": ["WINDOW_RELATIVE", "RELATIONSHIPS_NOT_COMPUTED_LIVE", "NO_PNL_INFERENCE"],
         "provenance": _provenance(event, "bounded_sql_aggregate"),
-    }
+    } | _delivery_timestamps(event)
 
 
 def mirror(event: dict) -> dict | None:
     item = trade(event)
     if not item:
         return None
+    published = datetime.fromisoformat(event["published_at"])
+    provider_received = event.get("provider_received_at")
+    observed = datetime.fromisoformat(provider_received or event["supplier_observed_at"])
     return {
         "event_id": hashlib.sha256(f"mirror:{event['event_id']}".encode()).hexdigest(),
         "chain_id": event["chain_id"],
@@ -95,14 +112,30 @@ def mirror(event: dict) -> dict | None:
         "observed_action": event["event_type"],
         "token_in": item["token_in"],
         "token_out": item["token_out"],
+        "amount_in_raw": item["amount_in_raw"],
+        "amount_out_raw": item["amount_out_raw"],
         "observation_timestamp": event["supplier_observed_at"],
-        "replication_delay_ms": None,
-        "execution_status": "MISSED_NO_QUOTE",
+        "replication_delay_ms": max(0, (published - observed).total_seconds() * 1000),
+        "replication_delay_measurement": (
+            "WEBSOCKET_PROVIDER_RECEIPT_TO_PUBLICATION_MEASURED"
+            if provider_received
+            else "HTTP_COLLECTOR_RECEIPT_TO_PUBLICATION_MEASURED"
+        ),
+        "execution_status": "OBSERVED_CONFIRMED_NO_QUOTE",
+        "signal_basis": "OBSERVED_CONFIRMED_CHAIN_FACT",
+        "usd_estimate": None,
+        "available_liquidity": None,
+        "estimated_slippage_bps": None,
+        "prediction": None,
         "estimated_cost": None,
         "estimated_pnl": None,
-        "missing_reason": "NO_EXECUTABLE_QUOTE_EVIDENCE",
-        "provenance": _provenance(event, "candidate_from_observed_swap", ["NOT_AN_EXECUTED_MIRROR_TRADE"]),
-    }
+        "missing_reason": "NO_PRICE_LIQUIDITY_OR_EXECUTABLE_QUOTE_EVIDENCE",
+        "provenance": _provenance(
+            event,
+            "candidate_from_observed_swap",
+            ["NOT_AN_EXECUTED_MIRROR_TRADE", "NO_PROFITABILITY_OR_EXECUTION_CLAIM"],
+        ),
+    } | _delivery_timestamps(event)
 
 
 def project(feed_id: str, event: dict, store=None) -> dict | None:

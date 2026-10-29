@@ -1,11 +1,14 @@
 # UME Data Supplier
 
-An independent FastAPI service that collects a bounded, restart-safe Ethereum wallet event feed and fans out existing exchange feeds. Delivery is protected with wallet authentication plus the existing UME `FeedAccess` entitlement contract.
+An independent FastAPI service that streams a bounded, restart-safe Ethereum wallet event feed and fans out existing exchange feeds. Ethereum WebSocket subscriptions provide low-latency block and log notifications; independent HTTP RPC calls verify canonical blocks and recover gaps and reorgs. Delivery is protected with wallet authentication plus the existing UME `FeedAccess` entitlement contract.
 
 The production adapter exposes four products from the same bounded, restart-safe store: `ethereum_wallet_trades_v1`, `ethereum_wallet_inventory_deltas_v1`, `ethereum_wallet_behavior_v1`, and `ethereum_mirror_candidates_v1`. They expose public metadata/schema/sample/health plus entitled SSE and JSON/CSV/Parquet history. Inventory is explicitly window-relative; missing executable quote evidence produces `MISSED_NO_QUOTE` with null cost and PnL. The service never accepts buyer private keys or executes trades.
 
 Binance, Coinbase, Kraken, and Hyperliquid collectors are disabled by default. Set
-`SUPPLIER_ENABLE_EXCHANGE_FEEDS=true` only in a deployment that intentionally serves those unrelated feeds. The public
+`SUPPLIER_ENABLE_EXCHANGE_FEEDS=true` only in a deployment that intentionally serves those unrelated feeds. Set
+`SUPPLIER_ETHEREUM_WS_URL` plus at least one HTTP RPC. WebSocket connectivity alone never marks the feed healthy: the
+health response separately reports chain advancement, useful published events, provider transport, and measured
+observation-to-publication latency. The public
 supplier catalog contains only the four wallet products. Per-buyer queues, delivery-rate windows, SQLite history, and
 exports are bounded; PyArrow is loaded lazily only when a buyer requests Parquet.
 The 256 MB deployment defaults to at most 10,000 rows per export and a 4 MiB SQLite page cache per connection.

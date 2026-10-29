@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     database_path: str = "./data/supplier.sqlite3"
     ethereum_rpc_url: str = "https://ethereum-rpc.publicnode.com"
     ethereum_fallback_rpc_urls: str = ""
+    ethereum_ws_url: str = ""
+    ethereum_fallback_ws_urls: str = ""
+    ethereum_pending_transactions: bool = False
+    ethereum_reconcile_seconds: float = Field(30, ge=5, le=300)
     ethereum_poll_seconds: float = Field(12, ge=1, le=300)
     ethereum_retry_max_seconds: float = Field(60, ge=1, le=600)
     ethereum_confirmations: int = Field(2, ge=0, le=64)
@@ -39,6 +43,12 @@ class Settings(BaseSettings):
     def ethereum_rpc_urls(self) -> list[str]:
         """Ordered ingestion providers. Payment verification always uses rpc_url."""
         values = [self.ethereum_rpc_url, *self.ethereum_fallback_rpc_urls.split(",")]
+        return [value.strip() for value in values if value.strip()]
+
+    @property
+    def ethereum_ws_urls(self) -> list[str]:
+        """Ordered event providers. Empty keeps the HTTP reconciliation mode."""
+        values = [self.ethereum_ws_url, *self.ethereum_fallback_ws_urls.split(",")]
         return [value.strip() for value in values if value.strip()]
 
     @property

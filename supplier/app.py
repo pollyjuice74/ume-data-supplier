@@ -35,6 +35,9 @@ wallet_collector = EthereumWalletCollector(
     cfg.ethereum_poll_seconds,
     cfg.ethereum_confirmations,
     cfg.ethereum_backfill_blocks,
+    websocket_urls=cfg.ethereum_ws_urls,
+    reconcile_seconds=cfg.ethereum_reconcile_seconds,
+    subscribe_pending=cfg.ethereum_pending_transactions,
 )
 wallet_collector.retention_days = cfg.retention_days
 wallet_collector.max_events = cfg.max_events
@@ -332,17 +335,23 @@ async def sse(request: Request, feed_id: str, ticket: str = Query(...), cursor: 
                 if item["event_id"] in delivered:
                     continue
                 delivered.add(item["event_id"])
-                yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(item)}\n\n"
+                delivered_item = item | {"supplier_delivery_at": utc_now()}
+                yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(delivered_item)}\n\n"
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(), 15)
-                    if item.get("_ume_control") == "DELIVERY_GAP":
+                    control = item.get("_ume_control")
+                    if control == "DELIVERY_GAP":
                         yield 'event: delivery_gap\ndata: {"code":"DELIVERY_GAP","reconnect_required":true}\n\n'
                         return
+                    if control:
+                        yield f"event: {control.lower()}\ndata: {hub_json(item)}\n\n"
+                        continue
                     if item["event_id"] in delivered:
                         continue
                     delivered.add(item["event_id"])
-                    yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(item)}\n\n"
+                    delivered_item = item | {"supplier_delivery_at": utc_now()}
+                    yield f"id: {item['event_id']}\nevent: wallet_event\ndata: {hub_json(delivered_item)}\n\n"
                 except TimeoutError:
                     if not await entitlements.active(claim["sub"], feed_id):
                         return

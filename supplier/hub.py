@@ -53,15 +53,17 @@ class FeedHub:
         self.subscribers[feed_id].discard(queue)
 
     def publish(self, feed_id: str, event: dict) -> None:
-        self.last_event[feed_id] = datetime.now(UTC)
-        self.latest[feed_id] = event
-        now = datetime.now(UTC).timestamp()
-        with self.rate_lock:
-            times = self.event_times[feed_id]
-            times.append(now)
-            cutoff = now - 60
-            while times and times[0] < cutoff:
-                times.popleft()
+        is_control = bool(event.get("_ume_control"))
+        if not is_control:
+            self.last_event[feed_id] = datetime.now(UTC)
+            self.latest[feed_id] = event
+            now = datetime.now(UTC).timestamp()
+            with self.rate_lock:
+                times = self.event_times[feed_id]
+                times.append(now)
+                cutoff = now - 60
+                while times and times[0] < cutoff:
+                    times.popleft()
         for queue in tuple(self.subscribers[feed_id]):
             if queue.full():
                 while not queue.empty():

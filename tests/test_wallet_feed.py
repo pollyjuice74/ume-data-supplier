@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from supplier import app as supplier_app
+from supplier.hub import FeedHub
 from supplier.wallet_collector import SWAP_V3, TRANSFER, EthereumWalletCollector
 from supplier.wallet_products import WALLET_FEED_IDS, project
 from supplier.wallet_store import WalletStore
@@ -153,9 +154,90 @@ def test_four_products_keep_missing_execution_evidence_null(tmp_path):
     trade = project("ethereum_wallet_trades_v1", event, store)
     mirror = project("ethereum_mirror_candidates_v1", event, store)
     assert trade["amount_in_raw"] == "25" and trade["amount_out_raw"] == "20"
-    assert mirror["execution_status"] == "MISSED_NO_QUOTE"
+    assert trade["provenance"]["limitations"] == ["POOL_TOKEN_METADATA_NOT_RESOLVED"]
+    assert mirror["execution_status"] == "OBSERVED_CONFIRMED_NO_QUOTE"
     assert mirror["estimated_pnl"] is None and mirror["estimated_cost"] is None
     assert len(WALLET_FEED_IDS) == 4
+
+
+def test_websocket_receipt_propagates_to_signal_latency(tmp_path):
+    store = WalletStore(str(tmp_path / "ws.sqlite3"))
+    collector = EthereumWalletCollector(
+        "http://unused",
+        store,
+        Hub(),
+        "ethereum_wallet_trades_v1",
+        1,
+        0,
+        1,
+        websocket_urls=["wss://primary.invalid"],
+    )
+    log = transfer_log() | {
+        "topics": [SWAP_V3, "0x" + "00" * 12 + "22" * 20, "0x" + "00" * 12 + "33" * 20],
+        "data": "0x" + (25).to_bytes(32, "big").hex() + ((1 << 256) - 20).to_bytes(32, "big").hex(),
+    }
+    collector._remember_provider_receipt(log)
+    key = (log["blockHash"].lower(), log["transactionHash"].lower(), 1)
+    received = collector._provider_receipts[key]
+    event = collector.normalize(log, "2026-01-01T00:00:00+00:00", received, received)[0]
+    signal = project("ethereum_mirror_candidates_v1", event, store)
+    assert event["provenance"]["transport"] == "websocket_trigger_http_verified"
+    assert signal["provider_received_at"] == received
+    assert signal["replication_delay_ms"] >= 0
+    assert collector.health()["ingestion_mode"] == "WEBSOCKET_WITH_HTTP_RECONCILIATION"
+
+
+def test_swap_direction_uses_resolved_pool_tokens(tmp_path):
+    store = WalletStore(str(tmp_path / "direction.sqlite3"))
+    collector = EthereumWalletCollector("http://unused", store, Hub(), "ethereum_wallet_trades_v1", 1, 0, 1)
+    log = transfer_log() | {
+        "topics": [SWAP_V3, "0x" + "00" * 12 + "22" * 20, "0x" + "00" * 12 + "33" * 20],
+        "data": "0x" + (25).to_bytes(32, "big").hex() + ((1 << 256) - 20).to_bytes(32, "big").hex(),
+        "_token0": "0x" + "aa" * 20,
+        "_token1": "0x" + "bb" * 20,
+        "_transaction_sender": "0x" + "cc" * 20,
+    }
+    event = collector.normalize(log, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:01+00:00")[0]
+    item = project("ethereum_wallet_trades_v1", event, store)
+    assert item["token_in"] == "0x" + "aa" * 20
+    assert item["token_out"] == "0x" + "bb" * 20
+    assert item["amount_in_raw"] == "25"
+    assert item["amount_out_raw"] == "20"
+    assert item["provenance"]["limitations"] == []
+    assert item["wallet"] == "0x" + "cc" * 20
+
+
+def test_reorg_control_does_not_replace_public_sample_or_rate():
+    hub = FeedHub(queue_size=4)
+    feed = "ethereum_mirror_candidates_v1"
+    sample = {"event_id": "observed-1"}
+    hub.publish(feed, sample)
+    before = hub.health(feed)
+    hub.publish(feed, {"_ume_control": "REORG_CORRECTION", "rewind_from_block": 10})
+    after = hub.health(feed)
+    assert hub.latest[feed] == sample
+    assert after["last_event_at"] == before["last_event_at"]
+    assert after["events_per_second_60s"] == before["events_per_second_60s"]
+
+
+async def test_reorg_emits_correction_and_rewinds(tmp_path, monkeypatch):
+    store = WalletStore(str(tmp_path / "reorg.sqlite3"))
+    hub = Hub()
+    collector = EthereumWalletCollector("http://unused", store, hub, "ethereum_wallet_trades_v1", 1, 0, 1)
+    store.ingest_block(block(), [])
+
+    async def rpc(method, params):
+        if method == "eth_blockNumber":
+            return hex(10)
+        if method == "eth_getBlockByNumber":
+            return {"hash": "0x" + "99" * 32, "parentHash": "0x" + "00" * 32, "timestamp": hex(1)}
+        return []
+
+    monkeypatch.setattr(collector, "rpc", rpc)
+    await collector.collect_once()
+    corrections = [event for _feed, event in hub.published if event.get("_ume_control") == "REORG_CORRECTION"]
+    assert len(corrections) == len(WALLET_FEED_IDS)
+    assert collector.health()["reorgs_detected"] == 1
 
 
 def test_events_after_cursor_is_ordered_and_rejects_unknown_cursor(tmp_path):
